@@ -17,18 +17,18 @@ const API = 'https://open.feishu.cn/open-apis'
 const HOME = process.env.DSH_HOME ?? join(homedir(), '.dsh')
 const REPLY_MAX = 4000
 
-// The plugin's own config schema. `appId` / `chatId` are marked `.volatile()` so they
-// appear in the settings form and can be edited there; without the marker the settings
-// write gate rejects every save (it looks like it saved, then silently reverts).
-// Volatile fields need a fixed object path — they must not sit inside another volatile.
+// The plugin's own config schema. `appId` / `chatId` / `secretName` are marked
+// `.volatile()` so they appear in the settings form and can be edited there; without the
+// marker the settings write gate rejects every save (it looks like it saved, then
+// silently reverts). Volatile fields need a fixed object path — none may sit inside
+// another volatile.
 export const Config = z.object({
   appId: z.string().default('').volatile()
     .description('飞书自建应用 App ID（cli_ 开头），留空则不启动桥接'),
   chatId: z.string().default('').volatile()
     .description('飞书群 chat_id（oc_ 开头），留空则不启动桥接'),
-  secretName: z.string().default('FEISHU_APP_SECRET')
-    .description('App Secret 在 secrets.json 中的条目名（不是环境变量名）'),
-  secretsPath: z.string().default(join(HOME, 'bot', 'secrets.json')),
+  secretName: z.string().default('FEISHU_APP_SECRET').volatile()
+    .description('存放 App Secret 的凭据条目名（不是环境变量名）'),
   botStatePath: z.string().default(join(HOME, 'bot', 'state.json')),
   cursorPath: z.string().default(join(HOME, 'bot', 'feishu-bridge-cursor.json')),
   pollSeconds: z.number().default(10).description('轮询间隔秒数，最小 2 秒'),
@@ -36,13 +36,17 @@ export const Config = z.object({
   prefix: z.string().default('[飞书群消息]'),
 })
 
+// Where the pre-credentials secret store lives. Kept as a module constant rather than a
+// config field: it is a fixed legacy location, not something a user configures. Only the
+// fallback path reads it, for installs that stored the secret before the credentials seam.
+const LEGACY_SECRETS_PATH = join(HOME, 'bot', 'secrets.json')
+
 // The config keys this plugin reads, in one place. Kept explicit rather than derived from
 // the schema's internals: the schema above must stay in step with this list.
 const CONFIG_KEYS = [
   'appId',
   'chatId',
   'secretName',
-  'secretsPath',
   'botStatePath',
   'cursorPath',
   'pollSeconds',
@@ -58,7 +62,6 @@ const FALLBACKS = {
   appId: '',
   chatId: '',
   secretName: 'FEISHU_APP_SECRET',
-  secretsPath: join(HOME, 'bot', 'secrets.json'),
   botStatePath: join(HOME, 'bot', 'state.json'),
   cursorPath: join(HOME, 'bot', 'feishu-bridge-cursor.json'),
   pollSeconds: 10,
@@ -230,7 +233,7 @@ function install(ctx, config = {}) {
 
   async function secretFromLegacyStore() {
     try {
-      const store = await readJson(options.secretsPath, null)
+      const store = await readJson(LEGACY_SECRETS_PATH, null)
       const entry = store?.secrets?.find?.(item => item?.name === options.secretName)
       return typeof entry?.value === 'string' && entry.value !== '' ? entry.value : undefined
     } catch (error) {

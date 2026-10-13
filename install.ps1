@@ -24,9 +24,13 @@ $script:Failed = $false
 # 需要同步的文件（相对路径），与 package.json 的 files 字段保持一致。
 # cordis.patch.yml 不在其中：项目里的那份只含占位符，现役那份含本机真实 appId/chatId，
 # 覆盖它会让桥接在重启后直接不启动。它由项目外的本地配置维护，见 config.example.yml。
+# lib\client.js 必须在清单里：package.json 声明了 exports["./client"] / dsh.client，
+# 加载器在激活阶段会 readFileSync 它，缺文件会抛 MissingClientBundleError 并把 fiber 打成 FAILED。
 $Payload = @(
     'index.js',
     'package.json',
+    'lib\index.js',
+    'lib\client.js',
     'locale\en.json',
     'locale\zh.json'
 )
