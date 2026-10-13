@@ -73,7 +73,16 @@ feishu-bridge/
 
 > `.env` 本身已被 `.gitignore` 挡住，`.env.example` 是占位符版本，可以进仓库。
 
-App Secret 不进代码、不进仓库：`secretName`（默认 `FEISHU_APP_SECRET`）是 `~/.dsh/bot/secrets.json` 里那条密钥条目的 **name**，插件按 `name` 查出 `value` 使用，不读环境变量。
+### App Secret
+
+App Secret 不进代码、不进仓库。插件按 `secretName`（默认 `FEISHU_APP_SECRET`）**依次**从两处取，先取到先用：
+
+1. **DSH 官方凭据库**（`ctx.credentials.resolve`）——存放在 `~/.dsh/.credentials.yaml`
+2. **兼容回退**：`~/.dsh/bot/secrets.json` 里 `name` 等于 `secretName` 的那条
+
+第 2 条是为了不要求老用户重填密钥而保留的兼容路径，新装用户走第 1 条即可。
+
+> ⚠️ **设 `FEISHU_APP_SECRET` 这个环境变量是没用的。** 插件全文只读三个环境变量：`DSH_HOME`、`FEISHU_BRIDGE_APP_ID`、`FEISHU_BRIDGE_CHAT_ID`——**它自己不读 secret 的环境变量**。官方凭据库确实有「启动环境优先」的机制，但那要求该变量由 DSH 以启动环境注入，普通地 export 一个同名变量**读不到**，插件会静默回退到第 2 条路径，看起来像「设了不生效」。
 
 ## 运行要求
 
