@@ -17,11 +17,11 @@ const API = 'https://open.feishu.cn/open-apis'
 const HOME = process.env.DSH_HOME ?? join(homedir(), '.dsh')
 const REPLY_MAX = 4000
 
-// The plugin's own config schema. `appId` / `chatId` / `secretName` are marked
-// `.volatile()` so they appear in the settings form and can be edited there; without the
-// marker the settings write gate rejects every save (it looks like it saved, then
-// silently reverts). Volatile fields need a fixed object path — none may sit inside
-// another volatile.
+// The plugin's own config schema. `appId` / `chatId` / `secretName` / `pollSeconds` are
+// marked `.volatile()` so they appear in the settings form and can be edited there;
+// without the marker the settings write gate rejects the edit (it looks like it saved,
+// then silently reverts). Volatile fields need a fixed object path — none may sit inside
+// another volatile. The remaining paths are host-internal and deliberately not editable.
 export const Config = z.object({
   appId: z.string().default('').volatile()
     .description('飞书自建应用 App ID（cli_ 开头），留空则不启动桥接'),
@@ -29,9 +29,10 @@ export const Config = z.object({
     .description('飞书群 chat_id（oc_ 开头），留空则不启动桥接'),
   secretName: z.string().default('FEISHU_APP_SECRET').volatile()
     .description('存放 App Secret 的凭据条目名（不是环境变量名）'),
+  pollSeconds: z.number().default(10).volatile()
+    .description('轮询间隔秒数，最小 2 秒'),
   botStatePath: z.string().default(join(HOME, 'bot', 'state.json')),
   cursorPath: z.string().default(join(HOME, 'bot', 'feishu-bridge-cursor.json')),
-  pollSeconds: z.number().default(10).description('轮询间隔秒数，最小 2 秒'),
   batchMax: z.number().default(10),
   prefix: z.string().default('[飞书群消息]'),
 })
@@ -175,11 +176,10 @@ function install(ctx, config = {}) {
   // The Main Bot's own chat, and the turn currently being answered.
   let mainSession
   let turnTexts = []
-  let currentTurn
-  // The turn number a delivered Feishu message opened, if any. Recognising it by the
-  // delivered prefix keeps a conversation typed in DSH from being echoed to the group,
-  // and makes each Feishu message answered by its own turn.
-  let feishuTurn
+  // True once a message the bridge delivered has opened a turn, until that turn ends.
+  // Recognising the message by the delivered prefix keeps a conversation typed in DSH
+  // from being echoed to the group, and makes each Feishu message answered by its own turn.
+  let feishuPending = false
 
   async function readJson(path, fallback) {
     try {

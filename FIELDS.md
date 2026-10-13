@@ -12,9 +12,9 @@
 | `appId` | string | `''` | 是 | **是** | 飞书自建应用 App ID，空则桥接不启动（日志 warn，不报错）；可在设置页编辑 |
 | `chatId` | string | `''` | 是 | **是** | 飞书群 `chat_id`（`oc_` 开头），空则桥接不启动；可在设置页编辑 |
 | `secretName` | string | `'FEISHU_APP_SECRET'` | 否 | **是** | **存放 App Secret 的凭据条目名**（DSH 凭据库里的 ref 名），不是环境变量名、也不是文件名；可在设置页编辑 |
+| `pollSeconds` | number | `10` | 否 | **是** | 轮询间隔秒数，实际取 `max(2, 值 \|\| 10)`；可在设置页编辑 |
 | `botStatePath` | string | `~/.dsh/bot/state.json` | 否 | 否 | 管家状态文件路径 |
 | `cursorPath` | string | `~/.dsh/bot/feishu-bridge-cursor.json` | 否 | 否 | 游标文件绝对路径 |
-| `pollSeconds` | number | `10` | 否 | 否 | 轮询间隔秒数，实际取 `max(2, 值 \|\| 10)` |
 | `batchMax` | number | `10` | 否 | 否 | 单轮最多处理的消息条数 |
 | `prefix` | string | `'[飞书群消息]'` | 否 | 否 | 投递给管家的消息前缀，也用于识别「这轮是飞书来的」 |
 
@@ -22,7 +22,10 @@
 
 > **`secretsPath` 已移除**（2026-10-13 第 3 步）。老的 `~/.dsh/bot/secrets.json` 位置改由模块常量 `LEGACY_SECRETS_PATH` 承载，只用于兼容回退读取，不再是一个配置项。
 
-> **volatile 说明**：标了 volatile 的字段才会出现在设置表单里。官方实现里，一个插件若**没有任何 volatile 字段**，设置写入会被写门拒绝（报 `has no volatile fields`），表现为「看起来保存成功、实际静默回滚」。这三个字段的 volatile 标记不能去掉。
+> **volatile 说明**：**只有标了 volatile 的字段才会出现在设置表单里，也只有它们能被设置页写回**（官方 `volatileForm` / `isVolatilePath`：非 volatile 的路径既进不了表单、也过不了写入检查）。所以：
+> - 页面上**每一个可编辑字段都必须是 volatile**，否则用户填了会被静默丢弃——这正是「看起来保存、实际回滚」的根源。
+> - 反过来说，一个插件若**没有任何 volatile 字段**，设置写入会被写门直接拒绝（报 `has no volatile fields`）。
+> - `botStatePath` / `cursorPath` / `batchMax` / `prefix` 是宿主内部路径与行为参数，**故意不标 volatile**，不给用户在页面上改。
 
 ## 2. 游标文件
 
