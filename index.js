@@ -199,10 +199,57 @@ function install(ctx, config = {}) {
     return cursor
   }
 
+  // App Secret 先走 DSH 官方凭据 seam（ctx.credentials.resolve，键名由 secretName 指定），
+  // 取不到再回退读老的 ~/.dsh/bot/secrets.json，兼容改造前已存好的密钥，避免要求用户重填。
+  // 官方 seam 的查找优先级由 provider 决定（启动环境 > 存储文件 > .env 兜底）。
   async function secret() {
-    const store = await readJson(options.secretsPath, null)
-    const entry = store?.secrets?.find?.(item => item?.name === options.secretName)
-    return typeof entry?.value === 'string' && entry.value !== '' ? entry.value : undefined
+    const fromSeam = await secretFromCredentials()
+    if (fromSeam !== undefined) return fromSeam
+    return secretFromLegacyStore()
+  }
+
+  async function secretFromCredentials() {
+    const svc = credentials()
+    if (typeof svc?.resolve !== 'function') return undefined
+    const name = options.secretName
+    if (typeof name !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+      // 名字不符合凭据引用语法（REF_PATTERN）时不能硬转，当作「此处没有」交给回退路径。
+      log('warn', `secretName "${name}" is not a valid credential reference; using the legacy store`)
+      return undefined
+    }
+    try {
+      // credentialRef() 只是「校验 REF_PATTERN + 原样返回字符串」（brandString 是恒等函数），
+      // 这里内联等价逻辑，避免为一个纯校验多引一个包。上面已先做过同样的正则校验。
+      const hit = await svc.resolve(name)
+      return typeof hit?.value === 'string' && hit.value !== '' ? hit.value : undefined
+    } catch (error) {
+      log('warn', `credential lookup failed, falling back to the legacy store: ${error?.message ?? error}`)
+      return undefined
+    }
+  }
+
+  async function secretFromLegacyStore() {
+    try {
+      const store = await readJson(options.secretsPath, null)
+      const entry = store?.secrets?.find?.(item => item?.name === options.secretName)
+      return typeof entry?.value === 'string' && entry.value !== '' ? entry.value : undefined
+    } catch (error) {
+      log('warn', `legacy secret store unreadable: ${error?.message ?? error}`)
+      return undefined
+    }
+  }
+
+  // 取凭据服务；插件在没有该服务的 composition 里仍要能工作（返回 undefined 即走回退）。
+  function credentials() {
+    try {
+      if (typeof ctx.inject === 'function') {
+        const sub = ctx.get?.('credentials')
+        if (sub !== undefined) return sub
+      }
+      return ctx.get?.('credentials') ?? ctx.credentials
+    } catch {
+      return undefined
+    }
   }
 
   async function accessToken() {
