@@ -76,7 +76,7 @@ cd feishu-bridge
 pwsh -File .\install.ps1
 ```
 
-安装脚本做三件事：把源码复制到 `~/.dsh/plugins/feishu-bridge`、逐个文件比对 SHA256（不一致立即失败退出）、检查目标目录的配置是否存在。它同时会校验 `~/.dsh/profiles/desktop/node_modules/feishu-bridge`（通常是同一个目录的 junction，两边是同一份文件，脚本只校验不复制）。
+安装脚本做四件事：把源码复制到 `~/.dsh/plugins/feishu-bridge`、逐个文件比对 SHA256（不一致立即失败退出）、**在目标缺少 `cordis.patch.yml` 时补一份占位符版本（已有则原样保留、绝不覆盖）**、报告配置的最终状态。它同时会校验 `~/.dsh/profiles/desktop/node_modules/feishu-bridge`（通常是同一个目录的 junction，两边是同一份文件，脚本只校验不复制）。
 
 ### 参数
 
@@ -92,9 +92,67 @@ pwsh -File .\install.ps1 -WhatIf
 pwsh -File .\install.ps1
 ```
 
+### 必须注册 bundle，否则插件不会被加载（最容易漏的一步）
+
+**只把文件复制到 `~/.dsh/plugins/feishu-bridge` 是不够的。** DSH 只从 profile 的 `package.json` 里 `dsh.profile.bundles` 列表发现 bundle；`~/.dsh/plugins/` 这个目录 DSH 本身并不认识。**不注册的话，DSH 不会报错、插件静默不加载，群里发消息也不会有任何反应。**
+
+两种注册方式，任选其一。
+
+**方式 1（推荐）：用 DSH 自带 CLI 一条命令搞定**
+
+```powershell
+dsh plugin --profile desktop add "$PWD"
+```
+
+它会在 profile 目录里跑 pnpm，把本目录以 `link:` 方式加进 `dependencies`，**并自动把 `feishu-bridge` 追加进 `dsh.profile.bundles`**（前提是包声明了 `dsh.bundle`，本项目已声明）。执行前请**完全退出 DSH**——profile 的 `package.json` 会被加锁写入。
+
+> 如果提示 `dsh` 不是可识别的命令：说明它不在 PATH 里（DSH 安装时未必会注册到 PATH）。`dsh` 是 DSH 安装目录下自带的 CLI，位置固定在**你安装 DSH 的目录**里：
+> ```
+> <你的 DSH 安装目录>\resources\runtime\cli\bin\dsh.cmd
+> ```
+> 例如 DSH 装在 `D:\App\deepseek-herness`，就用：
+> ```powershell
+> & "D:\App\deepseek-herness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add "$PWD"
+> ```
+> 请按你自己的安装位置替换。装完请确认这一步**没有报错**再继续。
+
+**方式 2（手工）：自己改 profile 的 `package.json`**
+
+编辑 `~/.dsh/profiles/desktop/package.json`，做两处改动：
+
+```jsonc
+{
+  "name": "dsh-profile-desktop",
+  "private": true,
+  "dsh": {
+    "profile": {
+      "bundles": [
+        // …已有的项…
+        "feishu-bridge"          // ← ① 追加这一行
+      ]
+    }
+  },
+  "dependencies": {
+    // …已有的项…
+    "feishu-bridge": "link:../../plugins/feishu-bridge"   // ← ② 加这一条
+  }
+}
+```
+
+> 路径 `../../plugins/feishu-bridge` 是相对 profile 目录（`~/.dsh/profiles/desktop/`）算的，指向 `~/.dsh/plugins/feishu-bridge`。如果你的安装目标不同，按实际相对路径调整。
+
+**验证注册成功**：改完后 `~/.dsh/profiles/desktop/package.json` 的 `dsh.profile.bundles` 里应能看到 `"feishu-bridge"`。
+
 ### 装完之后：必须重启 DSH
 
-插件跑在 DSH 进程内，**不重启仍是旧代码**。改任何源码后都是「跑 install.ps1 → 重启 DSH」。
+插件跑在 DSH 进程内，**不重启仍是旧代码**。改任何源码后都是「跑 install.ps1 → 重启 DSH」。首次安装的完整顺序是：
+
+```
+1. git clone + pwsh -File .\install.ps1
+2. 注册 bundle（dsh plugin … 或手工改 profile package.json）
+3. 重启 DSH   ← 不可省
+4. 填配置（设置页 / profile patch）
+```
 
 ### 首次启动会发生什么
 
@@ -105,14 +163,18 @@ pwsh -File .\install.ps1
 ### 卸载
 
 ```powershell
-# 1. 停掉 DSH
-# 2. 删除插件目录
+# 1. 完全退出 DSH
+# 2. 解除 bundle 注册（否则 DSH 启动时会找不到这个包而报错）
+dsh plugin --profile desktop remove feishu-bridge
+#    若 dsh 不在 PATH，用完整路径；或手工编辑 ~/.dsh/profiles/desktop/package.json：
+#    从 dependencies 删掉 "feishu-bridge"，从 dsh.profile.bundles 删掉 "feishu-bridge"
+# 3. 删除插件目录
 Remove-Item -Recurse -Force "$env:USERPROFILE\.dsh\plugins\feishu-bridge"
-# 3. 如果 node_modules 下的 feishu-bridge 是独立目录（不是 junction），一并删掉
+# 4. 如果 node_modules 下的 feishu-bridge 是独立目录（不是 junction），一并删掉
 Remove-Item -Recurse -Force "$env:USERPROFILE\.dsh\profiles\desktop\node_modules\feishu-bridge"
-# 4. 清理 profile 里引用它的 patch 条目（如有）
+# 5. 清理 profile patch 里引用它的条目（如有）
 #    编辑 ~/.dsh/profiles/desktop/cordis.patch.yml，删掉 id: feishu-bridge 那一段
-# 5. 可选：删掉游标
+# 6. 可选：删掉游标
 Remove-Item -Force "$env:USERPROFILE\.dsh\bot\feishu-bridge-cursor.json"
 ```
 
@@ -148,7 +210,7 @@ DSH 启动后，打开 **设置 → 内置插件 → 飞书桥接**，在页面�
 
 **环境变量**：参考 [.env.example](./.env.example)。在**启动 DSH 的那个终端**里先设好变量再启动 DSH（PowerShell：`$env:FEISHU_BRIDGE_APP_ID="cli_xxx"`）。注意 `.env.example` 只是示例文件、插件不会读它，插件读的是**进程环境变量**。
 
-> **仓库里那份 bundle 层（项目根目录的 `cordis.patch.yml`）只有空占位符**（`appId: ""` / `chatId: ""`），这是本仓库能公开的前提——任何真实值都不在仓库里。安装后它会复制到 `~/.dsh/plugins/feishu-bridge/cordis.patch.yml`，起初同样是空串，桥接不启动。
+> **仓库里那份 bundle 层（项目根目录的 `cordis.patch.yml`）只有空占位符**（`appId: ""` / `chatId: ""`），这是本仓库能公开的前提——任何真实值都不在仓库里。安装时若目标 `~/.dsh/plugins/feishu-bridge/cordis.patch.yml` **不存在**，脚本会把它复制过去（起初是空串，桥接不启动）；**若已存在则保留你那份，不覆盖**。
 >
 > 真实值请放在 **profile patch 层**（`~/.dsh/profiles/desktop/cordis.patch.yml`）或用上面的**设置页**填写，两者都在 `~/.dsh/` 下，不进任何仓库。
 >
@@ -213,9 +275,9 @@ feishu-bridge/
 ├── lib/
 │   ├── index.js          # 客户端包的宿主半侧，空 apply，只为在 Loader 里占一行
 │   └── client.js         # 浏览器半侧：设置页（设置 → 内置插件 → 飞书桥接）
-├── cordis.patch.yml      # bundle 挂载层：只有占位符，且不在同步清单里
+├── cordis.patch.yml      # bundle 挂载层：仓库里只有占位符；安装时目标缺失才补一份，已有则保留
 ├── locale/               # 中英文标题与描述
-├── install.ps1           # 复制安装到 ~/.dsh/plugins + 哈希校验
+├── install.ps1           # 复制安装到 ~/.dsh/plugins + 哈希校验（缺失时补 cordis.patch.yml）
 ├── FIELDS.md             # config 与游标字段清单（前后端唯一依据）
 ├── config.example.yml    # 本地配置示例（profile patch 层写法，值全是占位符）
 ├── .env.example          # 环境变量示例（值全是占位符）
@@ -234,11 +296,11 @@ feishu-bridge/
 
 `install.ps1` 会把本项目源码复制到 `~/.dsh/plugins/feishu-bridge`，再逐个文件比对 SHA256；不一致就直接报错退出，避免出现「改了这个、跑的是那个」的幽灵版本。
 
-同步清单**共 6 个文件**：`index.js`、`package.json`、`lib/index.js`、`lib/client.js`、`locale/en.json`、`locale/zh.json`。
+同步清单**共 6 个代码文件**：`index.js`、`package.json`、`lib/index.js`、`lib/client.js`、`locale/en.json`、`locale/zh.json`。这 6 个每次安装都从源码**复制并覆盖**。
 
-**`cordis.patch.yml` 不在同步清单里，改它不会生效。**
+**`cordis.patch.yml` 是另一个口径**：它是 DSH 加载器必需的挂载文件，但目标位置那份同时是本机真实 `appId` / `chatId` 的载体。所以安装脚本**只在目标缺失时**从仓库复制一份占位符版本，**已有则原样保留、绝不覆盖**。改仓库里那份不会影响你本机已填的真值。
 
-> 本项目是唯一源码源，但**只针对代码**。`~/.dsh/plugins/feishu-bridge/cordis.patch.yml` 存的是本机真实配置，不属于安装产物，脚本不会覆盖它。
+> 本项目是唯一源码源，但**只针对代码**。`~/.dsh/plugins/feishu-bridge/cordis.patch.yml` 属于安装产物（目标缺失时由脚本生成），但一旦它存在，就是本机配置、脚本不会再动它。
 
 > ⚠️ **改 `package.json` 时注意**：只要声明了 `exports["./client"]` / `dsh.client`，`lib/client.js` 就必须真实存在——加载器会 `readFileSync` 它，缺文件会抛错并把插件打成 FAILED。**先落盘文件，再加声明。**
 

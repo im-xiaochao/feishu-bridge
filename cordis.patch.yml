@@ -2,13 +2,15 @@
 #
 # ⚠️ 这个文件会随项目推送到 GitHub，里面只能有占位符，绝不能写真实值。
 #
-# 📌 安装脚本不会复制本文件到目标目录。install.ps1 只同步 6 个代码文件
-#    （index.js / package.json / lib/*.js / locale/*.json），复制完成后它只会检查
-#    目标位置有没有 cordis.patch.yml，没有就打一条 WARN 提示你创建，不会替你写。
-#    装完后请在下面这个位置自行创建该文件（内容可照抄本文件的 insert 段）：
-#      ~/.dsh/plugins/feishu-bridge/cordis.patch.yml
+# 📌 安装脚本对本文件的处理是「缺失才补、已有绝不动」：
+#    install.ps1 每次安装都会覆盖同步 6 个代码文件
+#    （index.js / package.json / lib/*.js / locale/*.json）；而本文件走单独一条路径——
+#    目标位置 ~/.dsh/plugins/feishu-bridge/cordis.patch.yml 缺失时，脚本会从仓库
+#    自动补一份这份占位符版本（否则 DSH 加载器因缺该必需文件而抛错、安装回滚）；
+#    已存在时则原样保留、绝不覆盖，以保住本机可能填过的真实 appId / chatId 不被顶掉。
+#    所以：全新环境无需手建，装完即可用。
 #
-#    真实 appId / chatId 放在项目之外，二选一：
+#    真实 appId / chatId 放在项目之外，三选一（推荐 a 或 c，不要直接改本仓库这份）：
 #      a) profile 的 patch 层（推荐）：~/.dsh/profiles/desktop/cordis.patch.yml
 #         用同一个 id 覆盖 config，本地生效、不进仓库：
 #           - id: feishu-bridge
@@ -18,9 +20,15 @@
 #               chatId: <你的真实 chatId>
 #               secretName: FEISHU_APP_SECRET
 #      b) 环境变量：FEISHU_BRIDGE_APP_ID / FEISHU_BRIDGE_CHAT_ID
+#      c) 设置页（图形界面）：DSH 启动后「设置 → 内置插件 → 飞书桥接」直接填，
+#         保存落在 profile 的本机配置里，不进仓库；App Secret 走凭据库，也不进仓库。
 #    取值规则：config 里的值一旦非空就生效，环境变量不再参与（不是被它覆盖）；
 #    只有 config 为空时才回退读环境变量；两者都空 → 桥接不启动（只打 warn）。
 #    占位符是空串时桥接不启动（只打 warn），不会误连到错误的群。
+#
+#    ⚠️ 若你把真值写进了装好后的 ~/.dsh/plugins/feishu-bridge/cordis.patch.yml
+#       （即本文件安装后的那份），它属于本机状态、不进 git；它有值时优先级高于
+#       profile 与上面的环境变量。要让 profile 生效，先把那份真值清成空串。
 #
 # 全部可配置项见 FIELDS.md；下面只列出常用项，secretName 可省略（默认 FEISHU_APP_SECRET）。
 - insert:
