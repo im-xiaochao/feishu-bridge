@@ -15,7 +15,9 @@ export const name = 'feishu-bridge'
 
 const API = 'https://open.feishu.cn/open-apis'
 const HOME = process.env.DSH_HOME ?? join(homedir(), '.dsh')
-const REPLY_MAX = 4000
+// A card's markdown element is happier with a few thousand characters; longer replies are
+// posted as several cards rather than truncated.
+const CHUNK_MAX = 3500
 
 // The plugin's own config schema. `appId` / `chatId` / `secretName` / `pollSeconds` are
 // marked `.volatile()` so they appear in the settings form and can be edited there;
@@ -109,6 +111,30 @@ function blocksToText(content) {
   if (!Array.isArray(content)) return ''
   return content.filter(block => block?.type === 'text' && typeof block.text === 'string')
     .map(block => block.text).join('')
+}
+
+// A long reply is split on line boundaries into card-sized parts, so nothing is lost and
+// no part is cut mid-sentence where it can be helped.
+function chunk(text, limit = CHUNK_MAX) {
+  if (text.length <= limit) return [text]
+  const parts = []
+  let current = ''
+  for (const line of text.split('\n')) {
+    // A single line longer than the limit is cut hard; nothing else can fit it.
+    if (line.length > limit) {
+      if (current !== '') { parts.push(current); current = '' }
+      for (let i = 0; i < line.length; i += limit) parts.push(line.slice(i, i + limit))
+      continue
+    }
+    if (current !== '' && current.length + line.length + 1 > limit) {
+      parts.push(current)
+      current = line
+    } else {
+      current = current === '' ? line : `${current}\n${line}`
+    }
+  }
+  if (current !== '') parts.push(current)
+  return parts
 }
 
 export function apply(ctx, config = {}) {
@@ -288,24 +314,31 @@ function install(ctx, config = {}) {
     return Array.isArray(body?.data?.items) ? body.data.items : []
   }
 
-  // Post one text message into the group.
+  // Post one reply into the group. A card with a markdown element renders the reply's
+  // own formatting (bold, lists, links, code), which a plain text message would show as
+  // literal asterisks and pipes.
   async function send(text) {
-    const trimmed = text.length > REPLY_MAX ? `${text.slice(0, REPLY_MAX)}\n…（回复过长，已截断）` : text
-    const response = await fetch(`${API}/im/v1/messages?receive_id_type=chat_id`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${await accessToken()}`,
-        'Content-Type': 'application/json; charset=utf-8',
-      },
-      body: JSON.stringify({
-        receive_id: options.chatId,
-        msg_type: 'text',
-        content: JSON.stringify({ text: trimmed }),
-      }),
-      signal: AbortSignal.timeout(20_000),
-    })
-    const body = await response.json().catch(() => ({}))
-    if (body?.code !== 0) throw new Error(`send refused (code ${body?.code ?? '?'})`)
+    for (const part of chunk(text)) {
+      const card = {
+        config: { wide_screen_mode: true },
+        elements: [{ tag: 'markdown', content: part }],
+      }
+      const response = await fetch(`${API}/im/v1/messages?receive_id_type=chat_id`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${await accessToken()}`,
+          'Content-Type': 'application/json; charset=utf-8',
+        },
+        body: JSON.stringify({
+          receive_id: options.chatId,
+          msg_type: 'interactive',
+          content: JSON.stringify(card),
+        }),
+        signal: AbortSignal.timeout(20_000),
+      })
+      const body = await response.json().catch(() => ({}))
+      if (body?.code !== 0) throw new Error(`send refused (code ${body?.code ?? '?'})`)
+    }
   }
 
   // The Main Bot's current own chat, read fresh so a fresh chat part is followed.
