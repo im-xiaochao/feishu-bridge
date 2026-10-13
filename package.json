@@ -1,0 +1,28 @@
+{
+  "name": "feishu-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Bridge a Feishu group chat and the Main Bot's own chat, both ways",
+  "license": "UNLICENSED",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "meta": {
+    "title": "飞书桥接",
+    "description": "把飞书群和管家对话接成双向通道：群里发的消息管家收得到，管家的回复也会回到群里。"
+  }
+}

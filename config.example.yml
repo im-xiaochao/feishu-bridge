@@ -1,0 +1,20 @@
+# feishu-bridge 本地配置示例
+#
+# 用法：把下面这段拷进 ~/.dsh/profiles/desktop/cordis.patch.yml（追加到数组末尾），
+# 或者作为独立文件保存。真实值只存在于 `~/.dsh/` 目录里，永远不进本仓库。
+#
+# 为什么放 profile 的 patch 层：bundle 层（项目里的 cordis.patch.yml）会随项目推送，
+# 只能放占位符；profile 的 patch 层是用户本机配置，不会进 git，用它按同一个 id 覆盖 config。
+#
+# 取值规则（按源码 index.js:78-83 的事实，不是「叠加覆盖」）：
+#   config 里的 appId/chatId 一旦非空，环境变量就完全不参与，不是被环境变量覆盖；
+#   只有 config 里为空（或缺失）时，才回退去读 FEISHU_BRIDGE_APP_ID / FEISHU_BRIDGE_CHAT_ID；
+#   两者都空 → 桥接关闭并打 warn。
+#   一句话：config 优先，环境变量只是 config 为空时的兜底，不存在反向覆盖。
+
+- id: feishu-bridge
+  name: feishu-bridge
+  config:
+    appId: cli_把你的真实appid填这里
+    chatId: oc_把你的真实群id填这里
+    pollSeconds: 10

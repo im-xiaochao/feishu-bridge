@@ -1,0 +1,4 @@
+{
+  "title": "Feishu Bridge",
+  "description": "A two-way bridge between a Feishu group chat and the Main Bot: group messages reach the Bot, and its replies return to the group."
+}

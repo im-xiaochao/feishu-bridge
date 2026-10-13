@@ -1,0 +1,35 @@
+node_modules/
+dist/
+build/
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ---- 敏感信息：绝不进 git ----
+# 本地真实配置（appId / chatId 等）
+config.local.yml
+config.local.yaml
+cordis.patch.local.yml
+*.local.yml
+*.local.yaml
+.env
+.env.*
+!.env.example
+
+# 密钥库
+secrets.json
+secrets*.json
+**/secrets*.json
+
+# 运行态数据：游标里有 chatId，state 里有会话/机器人状态
+feishu-bridge-cursor.json
+state.json
+
+# 其他常见凭证
+*.pem
+*.key
+credentials.json
+token.json

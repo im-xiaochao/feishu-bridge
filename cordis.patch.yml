@@ -1,0 +1,22 @@
+# The Feishu bridge's own bundle layer: one plugin entry, mounted with the profile.
+#
+# ⚠️ 这个文件会随项目推送到 GitHub，里面只能有占位符，绝不能写真实值。
+#    真实 appId / chatId 放在项目之外，二选一：
+#      a) profile 的 patch 层（推荐）：~/.dsh/profiles/desktop/cordis.patch.yml
+#         用同一个 id 覆盖 config，本地生效、不进仓库：
+#           - id: feishu-bridge
+#             name: feishu-bridge
+#             config:
+#               appId: <你的真实 appId>
+#               chatId: <你的真实 chatId>
+#      b) 环境变量：FEISHU_BRIDGE_APP_ID / FEISHU_BRIDGE_CHAT_ID
+#    取值规则：config 里的值一旦非空就生效，环境变量不再参与（不是被它覆盖）；
+#    只有 config 为空时才回退读环境变量；两者都空 → 桥接不启动（只打 warn）。
+#    占位符是空串时桥接不启动（只打 warn），不会误连到错误的群。
+- insert:
+    - id: feishu-bridge
+      name: feishu-bridge
+      config:
+        appId: ""
+        chatId: ""
+        pollSeconds: 10
