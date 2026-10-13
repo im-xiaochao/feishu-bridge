@@ -6,15 +6,22 @@
 # 为什么放 profile 的 patch 层：bundle 层（项目里的 cordis.patch.yml）会随项目推送，
 # 只能放占位符；profile 的 patch 层是用户本机配置，不会进 git，用它按同一个 id 覆盖 config。
 #
-# 取值规则（按源码 index.js:78-83 的事实，不是「叠加覆盖」）：
+# 取值规则（事实依据见 index.js 的 install() 里读 appId / chatId 的两段回退逻辑）：
 #   config 里的 appId/chatId 一旦非空，环境变量就完全不参与，不是被环境变量覆盖；
 #   只有 config 里为空（或缺失）时，才回退去读 FEISHU_BRIDGE_APP_ID / FEISHU_BRIDGE_CHAT_ID；
 #   两者都空 → 桥接关闭并打 warn。
 #   一句话：config 优先，环境变量只是 config 为空时的兜底，不存在反向覆盖。
+#
+# ⚠️ 下面两行的占位符必须先替换成真值。它们不是空串，直接照抄会被当成真值
+#    拿去做鉴权，结果是「鉴权失败」而不是「未配置」——排错方向会被带偏。
+#    真实格式：appId 形如 cli_xxxxxxxxxxxxxxxx，chatId 形如 oc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 - id: feishu-bridge
   name: feishu-bridge
   config:
-    appId: cli_把你的真实appid填这里
-    chatId: oc_把你的真实群id填这里
+    appId: cli_your_app_id_here
+    chatId: oc_your_chat_id_here
+    # 存 App Secret 的凭据条目名（DSH 凭据库里的 ref 名，不是环境变量名）。
+    # 可省略，省略时默认 FEISHU_APP_SECRET。
+    secretName: FEISHU_APP_SECRET
     pollSeconds: 10
