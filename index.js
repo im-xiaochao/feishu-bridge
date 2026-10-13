@@ -175,10 +175,11 @@ function install(ctx, config = {}) {
   // The Main Bot's own chat, and the turn currently being answered.
   let mainSession
   let turnTexts = []
-  // True once a message the bridge delivered has opened a turn, until that turn ends.
-  // Recognising the message by the delivered prefix keeps a conversation typed in DSH
-  // from being echoed to the group, and makes each Feishu message answered by its own turn.
-  let feishuPending = false
+  let currentTurn
+  // The turn number a delivered Feishu message opened, if any. Recognising it by the
+  // delivered prefix keeps a conversation typed in DSH from being echoed to the group,
+  // and makes each Feishu message answered by its own turn.
+  let feishuTurn
 
   async function readJson(path, fallback) {
     try {
@@ -318,7 +319,8 @@ function install(ctx, config = {}) {
     if (next !== mainSession) {
       mainSession = next
       turnTexts = []
-      feishuPending = false
+      currentTurn = undefined
+      feishuTurn = undefined
     }
     return mainSession
   }
