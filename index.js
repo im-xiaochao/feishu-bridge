@@ -175,10 +175,11 @@ function install(ctx, config = {}) {
   // The Main Bot's own chat, and the turn currently being answered.
   let mainSession
   let turnTexts = []
-  // True while the running turn was started by a message the bridge delivered. Recognising
-  // it by the delivered prefix keeps a conversation typed in DSH from being echoed to the
-  // group, and makes each Feishu message answered by its own turn.
-  let answeringFeishu = false
+  let currentTurn
+  // The turn number a delivered Feishu message opened, if any. Recognising it by the
+  // delivered prefix keeps a conversation typed in DSH from being echoed to the group,
+  // and makes each Feishu message answered by its own turn.
+  let feishuTurn
 
   async function readJson(path, fallback) {
     try {
@@ -318,7 +319,8 @@ function install(ctx, config = {}) {
     if (next !== mainSession) {
       mainSession = next
       turnTexts = []
-      answeringFeishu = false
+      currentTurn = undefined
+      feishuTurn = undefined
     }
     return mainSession
   }
@@ -393,29 +395,43 @@ function install(ctx, config = {}) {
   // The reply to a Feishu message goes back to the group. A turn is forwarded only when
   // the message that opened it was one the bridge delivered, so a conversation typed in
   // DSH stays in DSH.
+  //
+  // A turn receives more than one user/message: DSH's time-context plugin injects a
+  // synthetic clock message right after the real one, and a message queued while a turn
+  // runs lands after that turn's end. So only the bridge's own prefix may raise the flag,
+  // and nothing but turn/end may clear it — clearing it on any user/message is what
+  // silently swallowed every reply.
   function onSessionEvent(session, event) {
-    if (mainSession === undefined || session?.id !== mainSession) return
+    const id = session?.id
+    if (typeof id !== 'string') return
+    // Only the Main Bot's own chat is answered. Before the first poll has resolved which
+    // Session that is, a message carrying the bridge's prefix is proof enough — nothing
+    // else delivers it — so a message arriving in that first moment is not dropped.
+    const isMain = mainSession !== undefined && id === mainSession
+    const isPrefixed = event?.type === 'user/message'
+      && blocksToText(event.data?.content).startsWith(options.prefix)
+    if (!isMain && !(isPrefixed && mainSession === undefined)) return
+    if (!isMain) mainSession = id
     switch (event?.type) {
-      case 'user/message': {
-        // The turn this message opens is a Feishu turn when the message carries the
-        // bridge's own prefix.
-        const text = blocksToText(event.data?.content)
-        answeringFeishu = text.startsWith(options.prefix)
-        break
-      }
       case 'turn/start':
         turnTexts = []
         break
+      case 'user/message': {
+        if (isPrefixed) feishuPending = true
+        break
+      }
       case 'assistant/message': {
+        // Only the last assistant text is the turn's reply; earlier ones are the
+        // running commentary of its steps and would be noise in the group.
         const text = blocksToText(event.data?.message?.content).trim()
-        if (text !== '') turnTexts.push(text)
+        if (text !== '') turnTexts = [text]
         break
       }
       case 'turn/end': {
-        const owed = answeringFeishu
+        const owed = feishuPending
         const text = turnTexts.join('\n\n').trim()
         turnTexts = []
-        answeringFeishu = false
+        feishuPending = false
         if (owed && text !== '') {
           void send(text).catch(error => log('warn', `reply send failed: ${error?.message ?? error}`))
         }
