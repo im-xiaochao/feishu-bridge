@@ -9,13 +9,52 @@ import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
+import z from '@deepseek-ai/schemastery'
 
 export const name = 'feishu-bridge'
 
 const API = 'https://open.feishu.cn/open-apis'
 const HOME = process.env.DSH_HOME ?? join(homedir(), '.dsh')
 const REPLY_MAX = 4000
-const DEFAULTS = {
+
+// The plugin's own config schema. `appId` / `chatId` are marked `.volatile()` so they
+// appear in the settings form and can be edited there; without the marker the settings
+// write gate rejects every save (it looks like it saved, then silently reverts).
+// Volatile fields need a fixed object path — they must not sit inside another volatile.
+export const Config = z.object({
+  appId: z.string().default('').volatile()
+    .description('飞书自建应用 App ID（cli_ 开头），留空则不启动桥接'),
+  chatId: z.string().default('').volatile()
+    .description('飞书群 chat_id（oc_ 开头），留空则不启动桥接'),
+  secretName: z.string().default('FEISHU_APP_SECRET')
+    .description('App Secret 在 secrets.json 中的条目名（不是环境变量名）'),
+  secretsPath: z.string().default(join(HOME, 'bot', 'secrets.json')),
+  botStatePath: z.string().default(join(HOME, 'bot', 'state.json')),
+  cursorPath: z.string().default(join(HOME, 'bot', 'feishu-bridge-cursor.json')),
+  pollSeconds: z.number().default(10).description('轮询间隔秒数，最小 2 秒'),
+  batchMax: z.number().default(10),
+  prefix: z.string().default('[飞书群消息]'),
+})
+
+// The config keys this plugin reads, in one place. Kept explicit rather than derived from
+// the schema's internals: the schema above must stay in step with this list.
+const CONFIG_KEYS = [
+  'appId',
+  'chatId',
+  'secretName',
+  'secretsPath',
+  'botStatePath',
+  'cursorPath',
+  'pollSeconds',
+  'batchMax',
+  'prefix',
+]
+
+// Fallbacks used when a key is absent from the resolved config — e.g. a profile that
+// still points at an older patch, or a direct `apply()` call with no config at all. The
+// schema's own `.default()` is what the loader normally supplies; these keep the plugin
+// behaving exactly as before if it is not applied through the loader.
+const FALLBACKS = {
   appId: '',
   chatId: '',
   secretName: 'FEISHU_APP_SECRET',
@@ -26,6 +65,13 @@ const DEFAULTS = {
   batchMax: 10,
   prefix: '[飞书群消息]',
 }
+
+// A volatile field resolves to a wrapper; read it with `.get()` where it is one, and
+// take the plain value otherwise, so the rest of the plugin keeps reading plain fields.
+const valueOf = (value) => (value !== null && typeof value === 'object' && typeof value.get === 'function'
+  ? value.get()
+  : value)
+
 
 // Plain text only. A system notice (a rename, a photo change, a join) also arrives as a
 // "text" message, but its content is a JSON object of template fields, so anything that
@@ -72,7 +118,14 @@ export function apply(ctx, config = {}) {
 }
 
 function install(ctx, config = {}) {
-  const options = { ...DEFAULTS, ...(config ?? {}) }
+  // The loader hands us the resolved config; volatile fields arrive as wrappers and are
+  // unwrapped here once, so everything below reads plain values. Any key the resolved
+  // config does not carry falls back to FALLBACKS, keeping the pre-schema behaviour.
+  const options = {}
+  for (const key of CONFIG_KEYS) {
+    const value = valueOf(config?.[key])
+    options[key] = value === undefined ? FALLBACKS[key] : value
+  }
   // 明文 appId/chatId 不进仓库：bundle 层只放占位符，真实值优先由 profile 的 patch 层
   // 覆盖（config 里已给真值时不读环境变量），否则退回环境变量。
   if (options.appId === '' || options.appId === undefined) {
