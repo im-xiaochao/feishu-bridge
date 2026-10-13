@@ -319,8 +319,7 @@ function install(ctx, config = {}) {
     if (next !== mainSession) {
       mainSession = next
       turnTexts = []
-      currentTurn = undefined
-      feishuTurn = undefined
+      feishuPending = false
     }
     return mainSession
   }
