@@ -18,10 +18,6 @@ const HOME = process.env.DSH_HOME ?? join(homedir(), '.dsh')
 // A card's markdown element is happier with a few thousand characters; longer replies are
 // posted as several cards rather than truncated.
 const CHUNK_MAX = 3500
-// The one place images from the group are archived, by the user's own rule: every picture
-// that reaches the Bot is written here and nowhere else. Not configurable on purpose — a
-// second location would make "the pictures are all in one folder" stop being true.
-const IMAGE_DIR = 'D:\\Code\\Life\\Pic'
 // How many polls a failing picture may hold the cursor before it is passed over. Bounded
 // so one unreadable image can never freeze every later message.
 const IMAGE_MAX_ATTEMPTS = 3
@@ -51,6 +47,8 @@ export const Config = z.object({
     .description('存放 App Secret 的凭据条目名（不是环境变量名）'),
   pollSeconds: z.number().default(10).volatile()
     .description('轮询间隔秒数，最小 2 秒'),
+  picDir: z.string().default(join(HOME, 'Pic')).volatile()
+    .description('群图片归档目录：每张图片写到这里，且只写这里'),
   botStatePath: z.string().default(join(HOME, 'bot', 'state.json')),
   cursorPath: z.string().default(join(HOME, 'bot', 'feishu-bridge-cursor.json')),
   batchMax: z.number().default(10),
@@ -71,6 +69,7 @@ const CONFIG_KEYS = [
   'botStatePath',
   'cursorPath',
   'pollSeconds',
+  'picDir',
   'batchMax',
   'prefix',
 ]
@@ -86,6 +85,7 @@ const FALLBACKS = {
   botStatePath: join(HOME, 'bot', 'state.json'),
   cursorPath: join(HOME, 'bot', 'feishu-bridge-cursor.json'),
   pollSeconds: 10,
+  picDir: join(HOME, 'Pic'),
   batchMax: 10,
   prefix: '[飞书群消息]',
 }
@@ -302,7 +302,7 @@ function install(ctx, config = {}) {
   // eventually skipped rather than holding the cursor forever.
   const imageFailures = new Map()
   // Archive result per picture (message id plus image_key), so retrying a delivery that
-  // failed after the write reuses the file already in IMAGE_DIR instead of writing a
+  // failed after the write reuses the file already in picDir instead of writing a
   // second one under a fresh timestamp.
   //
   // Bounded to IMAGE_ARCHIVE_MEMORY entries, oldest first. Evicting an entry only forgets
@@ -456,15 +456,15 @@ function install(ctx, config = {}) {
     return bytes
   }
 
-  // Write one image into IMAGE_DIR and nowhere else. The bytes land in a `.part` file
+  // Write one image into options.picDir and nowhere else. The bytes land in a `.part` file
   // inside the same directory first, then get renamed into place, so a half-written file
   // never appears under the final name; the temporary is removed in every outcome.
   async function saveImageFile(bytes) {
     const format = imageFormatOf(bytes)
     if (format === undefined) throw new Error('downloaded bytes are not a recognised image format')
-    await mkdir(IMAGE_DIR, { recursive: true })
+    await mkdir(options.picDir, { recursive: true })
     const name = `${imageFileName()}${format.ext}`
-    const target = join(IMAGE_DIR, name)
+    const target = join(options.picDir, name)
     const temporary = `${target}.part`
     try {
       await writeFile(temporary, bytes)
@@ -536,7 +536,7 @@ function install(ctx, config = {}) {
     return true
   }
 
-  // A picture is archived to IMAGE_DIR and handed to the Bot in the same prompt: the
+  // A picture is archived to picDir and handed to the Bot in the same prompt: the
   // image block carries the bytes as base64, so the Bot sees the picture itself, and the
   // text block carries the absolute path so it also knows where the archive copy lives.
   //
@@ -550,7 +550,7 @@ function install(ctx, config = {}) {
   //
   // Archiving is idempotent per `archiveKey`: the bytes are written once and the same
   // path is reused when a later attempt retries the prompt. A retry after a prompt
-  // failure must never leave a second copy in IMAGE_DIR — the folder holds one file per
+  // failure must never leave a second copy in picDir — the folder holds one file per
   // message, and the timestamped name would otherwise differ on every attempt.
   async function deliverImage(record) {
     if (sessionController === undefined) return false

@@ -27,8 +27,12 @@
 #    占位符是空串时桥接不启动（只打 warn），不会误连到错误的群。
 #
 #    ⚠️ 若你把真值写进了装好后的 ~/.dsh/plugins/feishu-bridge/cordis.patch.yml
-#       （即本文件安装后的那份），它属于本机状态、不进 git；它有值时优先级高于
-#       profile 与上面的环境变量。要让 profile 生效，先把那份真值清成空串。
+#       （即本文件安装后的那份），它属于本机状态、不进 git。层级顺序是
+#       bundle → profile → home → CLI（dsh-app-boot 源码注释原文），后一层覆盖前一层，
+#       所以 profile 层会压过它；要让 profile 生效不必清空它。
+#       但要注意：覆盖是「整份 config 替换」，不是逐字段合并（源码 target[key] = value），
+#       所以 profile 里那份必须把 appId / chatId / secretName / pollSeconds 都写全，
+#       漏掉的字段会回落成 schema 默认值（appId 变空 → 桥接不启动）。
 #
 # 全部可配置项见 FIELDS.md；下面只列出常用项，secretName 可省略（默认 FEISHU_APP_SECRET）。
 - insert:
