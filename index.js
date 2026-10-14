@@ -320,6 +320,11 @@ function install(ctx, config = {}) {
   // Recognising the message by the delivered prefix keeps a conversation typed in DSH
   // from being echoed to the group, and makes each Feishu message answered by its own turn.
   let feishuPending = false
+  // Whether the Main Bot's own chat is inside a turn right now, and who opened it:
+  // 'feishu' when the bridge's own prefixed message did, 'dsh' when the user typed in
+  // DSH. This decides how a new Feishu message is delivered — see deliveryMode().
+  let turnRunning = false
+  let turnOwner
 
   async function readJson(path, fallback) {
     try {
@@ -520,6 +525,21 @@ function install(ctx, config = {}) {
     return mainSession
   }
 
+  // How a Feishu message is handed to the Main Bot's own chat.
+  //
+  // `steer` cuts into a running turn at its next step and starts a turn at once when the
+  // chat is idle, so a message the user sends in the group is seen immediately instead of
+  // waiting behind whatever is running — that is the whole point of this choice.
+  //
+  // But steering into a turn that the *user* opened in DSH would make the group answer a
+  // DSH conversation: the reply that turn ends with is posted to the group, and the group
+  // has no business seeing it. So a turn opened in DSH keeps the queueing behaviour, and
+  // only an idle chat, or a turn the bridge itself opened, is steered into.
+  function deliveryMode() {
+    if (!turnRunning) return 'steer'
+    return turnOwner === 'feishu' ? 'steer' : 'queue'
+  }
+
   async function deliver(record) {
     if (sessionController === undefined) return false
     const sessionId = await refreshMainSession()
@@ -530,7 +550,7 @@ function install(ctx, config = {}) {
     await sessionController.prompt({
       requestId: randomUUID(),
       sessionId,
-      mode: 'queue',
+      mode: deliveryMode(),
       content: [{ type: 'text', text: `${options.prefix} ${record.text}` }],
     }, AbortSignal.timeout(30_000))
     return true
@@ -575,7 +595,7 @@ function install(ctx, config = {}) {
     await sessionController.prompt({
       requestId: randomUUID(),
       sessionId,
-      mode: 'queue',
+      mode: deliveryMode(),
       content: [
         { type: 'text', text: `${options.prefix} [图片] 已保存：${saved.path}` },
         { type: 'image', mediaType: saved.format.mediaType, data: record.bytes.toString('base64'), name: saved.name },
@@ -716,9 +736,18 @@ function install(ctx, config = {}) {
     switch (event?.type) {
       case 'turn/start':
         turnTexts = []
+        // The turn's owner is decided by what opened it. A DSH-typed message is any
+        // user/message that is not the bridge's own prefix; the bridge only ever opens a
+        // turn with that prefix, so this cannot misread its own delivery.
+        turnRunning = true
+        turnOwner = 'dsh'
         break
       case 'user/message': {
-        if (isPrefixed) feishuPending = true
+        if (isPrefixed) {
+          feishuPending = true
+          // A steered or queued Feishu message is what opened this turn.
+          turnOwner = 'feishu'
+        }
         break
       }
       case 'assistant/message': {
@@ -733,6 +762,8 @@ function install(ctx, config = {}) {
         const text = turnTexts.join('\n\n').trim()
         turnTexts = []
         feishuPending = false
+        turnRunning = false
+        turnOwner = undefined
         if (owed && text !== '') {
           void send(text).catch(error => log('warn', `reply send failed: ${error?.message ?? error}`))
         }
