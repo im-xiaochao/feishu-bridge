@@ -1,7 +1,7 @@
 # feishu-bridge 字段清单（前后端唯一依据）
 
 本文件是 feishu-bridge 的唯一字段契约。任何一方要改字段名或类型，必须先改本文件并在群里同步，另一方确认后才能动代码。
-依据来源：现役插件 `~/.dsh/plugins/feishu-bridge/index.js`（2026-10-13 核对）。
+依据来源：现役插件 `~/.dsh/plugins/feishu-bridge/index.js`（2026-10-14 核对，`picDir` 加入 volatile 后同步更新）。
 
 ## 1. 插件 config 项
 
@@ -13,6 +13,7 @@
 | `chatId` | string | `''` | 是 | **是** | 飞书群 `chat_id`（`oc_` 开头），空则桥接不启动；可在设置页编辑 |
 | `secretName` | string | `'FEISHU_APP_SECRET'` | 否 | **是** | **存放 App Secret 的凭据条目名**（DSH 凭据库里的 ref 名），不是环境变量名、也不是文件名；可在设置页编辑 |
 | `pollSeconds` | number | `10` | 否 | **是** | 轮询间隔秒数，实际取 `max(2, 值 \|\| 10)`；可在设置页编辑 |
+| `picDir` | string | `~/.dsh/Pic` | 否 | **是** | **群图片归档目录**：每张图写到这里且只写这里；可在设置页编辑。⚠️ 默认不是 `D:\Code\Life\Pic`——要按用户约束落位，profile 层或设置页必须**显式写**，否则整份替换时漏掉它就回落到默认 |
 | `botStatePath` | string | `~/.dsh/bot/state.json` | 否 | 否 | 管家状态文件路径 |
 | `cursorPath` | string | `~/.dsh/bot/feishu-bridge-cursor.json` | 否 | 否 | 游标文件绝对路径 |
 | `batchMax` | number | `10` | 否 | 否 | 单轮最多处理的消息条数 |
@@ -26,6 +27,7 @@
 > - 页面上**每一个可编辑字段都必须是 volatile**，否则用户填了会被静默丢弃——这正是「看起来保存、实际回滚」的根源。
 > - 反过来说，一个插件若**没有任何 volatile 字段**，设置写入会被写门直接拒绝（报 `has no volatile fields`）。
 > - `botStatePath` / `cursorPath` / `batchMax` / `prefix` 是宿主内部路径与行为参数，**故意不标 volatile**，不给用户在页面上改。
+> - `picDir` 是 volatile 但语义特殊：它是**归档位置**，改了会让新旧图片落在两个目录。改动前先确认旧目录里的图是否需要挪。
 
 ## 2. 游标文件
 

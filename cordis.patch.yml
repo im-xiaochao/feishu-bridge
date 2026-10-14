@@ -31,8 +31,9 @@
 #       bundle → profile → home → CLI（dsh-app-boot 源码注释原文），后一层覆盖前一层，
 #       所以 profile 层会压过它；要让 profile 生效不必清空它。
 #       但要注意：覆盖是「整份 config 替换」，不是逐字段合并（源码 target[key] = value），
-#       所以 profile 里那份必须把 appId / chatId / secretName / pollSeconds 都写全，
-#       漏掉的字段会回落成 schema 默认值（appId 变空 → 桥接不启动）。
+#       所以 profile 里那份必须把 appId / chatId / secretName / pollSeconds / picDir 都写全，
+#       漏掉的字段会回落成 schema 默认值（appId 变空 → 桥接不启动；
+#       picDir 变空 → 回落默认 ~/.dsh/Pic，不再是你的归档目录——要按你的约束落位就显式写）。
 #
 # 全部可配置项见 FIELDS.md；下面只列出常用项，secretName 可省略（默认 FEISHU_APP_SECRET）。
 - insert:
@@ -43,3 +44,6 @@
         chatId: ""
         secretName: FEISHU_APP_SECRET
         pollSeconds: 10
+        # picDir: D:\Code\Life\Pic   ← 图片归档目录，默认 ~/.dsh/Pic。
+        #   注意上面的「整份 config 替换」规则：profile 层写 config 时若漏掉 picDir，
+        #   它就回落默认。想固定归档位置，就在你的 profile patch 层里显式写这一行。
