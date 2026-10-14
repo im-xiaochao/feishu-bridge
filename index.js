@@ -6,7 +6,7 @@
 // and are disposed when DSH disposes the plugin, so closing DSH ends the polling and
 // leaves nothing behind — no helper process, no scheduled task, no port.
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import z from '@deepseek-ai/schemastery'
@@ -18,6 +18,24 @@ const HOME = process.env.DSH_HOME ?? join(homedir(), '.dsh')
 // A card's markdown element is happier with a few thousand characters; longer replies are
 // posted as several cards rather than truncated.
 const CHUNK_MAX = 3500
+// The one place images from the group are archived, by the user's own rule: every picture
+// that reaches the Bot is written here and nowhere else. Not configurable on purpose — a
+// second location would make "the pictures are all in one folder" stop being true.
+const IMAGE_DIR = 'D:\\Code\\Life\\Pic'
+// How many polls a failing picture may hold the cursor before it is passed over. Bounded
+// so one unreadable image can never freeze every later message.
+const IMAGE_MAX_ATTEMPTS = 3
+// How many archived pictures are remembered for idempotent retries. See the note on the
+// `archived` map for why this is a cap rather than unbounded.
+const IMAGE_ARCHIVE_MEMORY = 500
+// The Feishu resource download endpoint speaks these; the file signature decides the
+// extension, since a message only carries an opaque image_key.
+const IMAGE_EXTENSIONS = [
+  { ext: '.png', mediaType: 'image/png', matches: bytes => bytes.length > 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47 },
+  { ext: '.jpg', mediaType: 'image/jpeg', matches: bytes => bytes.length > 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff },
+  { ext: '.gif', mediaType: 'image/gif', matches: bytes => bytes.length > 6 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 },
+  { ext: '.webp', mediaType: 'image/webp', matches: bytes => bytes.length > 12 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50 },
+]
 
 // The plugin's own config schema. `appId` / `chatId` / `secretName` / `pollSeconds` are
 // marked `.volatile()` so they appear in the settings form and can be edited there;
@@ -104,6 +122,88 @@ function isUserText(message) {
   if (message?.msg_type !== 'text') return false
   const text = clean(textOf(message))
   return text !== '' && !text.startsWith('{"template"')
+}
+
+// The image_key inside an image message, or '' when the message is not one. An image
+// message carries `{"image_key":"img_xxx"}`; anything else parses to ''.
+function imageKeyOf(message) {
+  const raw = message?.body?.content
+  if (typeof raw !== 'string') return ''
+  try {
+    const parsed = JSON.parse(raw)
+    return typeof parsed?.image_key === 'string' ? parsed.image_key : ''
+  } catch {
+    return ''
+  }
+}
+
+// A person's picture, and only that: the Bot's own echo, a system notice and a card are
+// all excluded the same way text messages are. Kept separate from isUserText so the text
+// path keeps its exact meaning.
+function isUserImage(message) {
+  if (message?.sender?.sender_type !== 'user') return false
+  if (message?.msg_type !== 'image') return false
+  return imageKeyOf(message) !== ''
+}
+
+// A rich-text ("post") message embeds its images as image_key tags inside the post body.
+// Walk the parsed JSON for any image_key so a picture posted with text is still archived;
+// a shape we do not recognise simply yields none, and the message is left alone.
+function postImageKeys(message) {
+  const raw = message?.body?.content
+  if (typeof raw !== 'string') return []
+  let parsed
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return []
+  }
+  const keys = []
+  const walk = node => {
+    if (node === null || typeof node !== 'object') return
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item)
+      return
+    }
+    if (typeof node.image_key === 'string' && node.image_key !== '') keys.push(node.image_key)
+    for (const value of Object.values(node)) walk(value)
+  }
+  walk(parsed)
+  return keys
+}
+
+// The extension and media type a downloaded body actually is, decided by its own bytes:
+// the download endpoint does not tell us, and an image_key carries no extension.
+function imageFormatOf(bytes) {
+  return IMAGE_EXTENSIONS.find(format => format.matches(bytes))
+}
+
+// Local date and time, with milliseconds so two pictures in the same second never collide.
+// Example: 20261014-181530-482.
+function imageFileName(date = new Date()) {
+  const pad = (value, width = 2) => String(value).padStart(width, '0')
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}`
+    + `-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`
+    + `-${pad(date.getMilliseconds(), 3)}`
+}
+
+// Whether an image failure will never resolve on its own. A recalled or expired picture
+// must be skipped rather than retried forever, because the cursor only advances past it
+// when the message is given up on; a transient failure is retried on the next poll.
+function isPermanentImageError(error) {
+  return error?.imagePermanent === true
+}
+
+function permanentImageError(message) {
+  const error = new Error(message)
+  error.imagePermanent = true
+  return error
+}
+
+function transientImageError(message) {
+  const error = new Error(message)
+  error.imagePermanent = false
+  return error
 }
 
 // The text of a message's content blocks (an assistant message or a user message).
@@ -198,6 +298,20 @@ function install(ctx, config = {}) {
   let tokenUntil = 0
   let cursor = null
   const seen = new Set()
+  // Consecutive failures per picture message id, so a permanently unreadable image is
+  // eventually skipped rather than holding the cursor forever.
+  const imageFailures = new Map()
+  // Archive result per picture (message id plus image_key), so retrying a delivery that
+  // failed after the write reuses the file already in IMAGE_DIR instead of writing a
+  // second one under a fresh timestamp.
+  //
+  // Bounded to IMAGE_ARCHIVE_MEMORY entries, oldest first. Evicting an entry only forgets
+  // that the file exists: a retry arriving after eviction writes a fresh copy under a new
+  // timestamp. That is the deliberate trade — the window covers any realistic retry
+  // (IMAGE_MAX_ATTEMPTS polls), and an unbounded map would grow for the life of the
+  // process. A duplicate here is preferable to a leak; it is not a bug to be "fixed" by
+  // removing the cap.
+  const archived = new Map()
 
   // The Main Bot's own chat, and the turn currently being answered.
   let mainSession
@@ -314,6 +428,55 @@ function install(ctx, config = {}) {
     return Array.isArray(body?.data?.items) ? body.data.items : []
   }
 
+  // Fetch one image's bytes from the group. The endpoint returns the raw body, not JSON,
+  // so a refusal is read from the status line and the body is taken verbatim otherwise.
+  //
+  // A 4xx means this particular picture will never be readable (it was recalled, its
+  // resource expired, or the key is stale): retrying it forever would freeze the cursor
+  // and block every later message, so it is marked permanent and the caller skips it.
+  // Everything else (network trouble, 5xx, a timeout) is transient and worth retrying.
+  async function downloadImage(messageId, fileKey) {
+    const url = `${API}/im/v1/messages/${encodeURIComponent(messageId)}/resources/${encodeURIComponent(fileKey)}?type=image`
+    let response
+    try {
+      response = await fetch(url, {
+        headers: { Authorization: `Bearer ${await accessToken()}` },
+        signal: AbortSignal.timeout(30_000),
+      })
+    } catch (error) {
+      throw transientImageError(`image download failed: ${error?.message ?? error}`)
+    }
+    if (!response.ok) {
+      const detail = `image download refused (HTTP ${response.status})`
+      if (response.status >= 400 && response.status < 500) throw permanentImageError(detail)
+      throw transientImageError(detail)
+    }
+    const bytes = Buffer.from(await response.arrayBuffer())
+    if (bytes.length === 0) throw transientImageError('image download returned no bytes')
+    return bytes
+  }
+
+  // Write one image into IMAGE_DIR and nowhere else. The bytes land in a `.part` file
+  // inside the same directory first, then get renamed into place, so a half-written file
+  // never appears under the final name; the temporary is removed in every outcome.
+  async function saveImageFile(bytes) {
+    const format = imageFormatOf(bytes)
+    if (format === undefined) throw new Error('downloaded bytes are not a recognised image format')
+    await mkdir(IMAGE_DIR, { recursive: true })
+    const name = `${imageFileName()}${format.ext}`
+    const target = join(IMAGE_DIR, name)
+    const temporary = `${target}.part`
+    try {
+      await writeFile(temporary, bytes)
+      await rename(temporary, target)
+    } catch (error) {
+      // Nothing half-written may survive a failure, including the rename itself.
+      await unlink(temporary).catch(() => {})
+      throw error
+    }
+    return { path: target, name, format, bytes: bytes.length }
+  }
+
   // Post one reply into the group. A card with a markdown element renders the reply's
   // own formatting (bold, lists, links, code), which a plain text message would show as
   // literal asterisks and pipes.
@@ -373,6 +536,54 @@ function install(ctx, config = {}) {
     return true
   }
 
+  // A picture is archived to IMAGE_DIR and handed to the Bot in the same prompt: the
+  // image block carries the bytes as base64, so the Bot sees the picture itself, and the
+  // text block carries the absolute path so it also knows where the archive copy lives.
+  //
+  // The prefix must stay at the very start of the text block: the reply routing
+  // recognises a delivered turn by `blocksToText(...).startsWith(prefix)`.
+  //
+  // `session/prompt` accepts an image block as `{ type, mediaType, data }` with base64
+  // bytes — no receipt is involved (only a `file` block needs one). The Host admits the
+  // bytes itself through the attachment service, which is what stores the framework's
+  // internal read-only copy.
+  //
+  // Archiving is idempotent per `archiveKey`: the bytes are written once and the same
+  // path is reused when a later attempt retries the prompt. A retry after a prompt
+  // failure must never leave a second copy in IMAGE_DIR — the folder holds one file per
+  // message, and the timestamped name would otherwise differ on every attempt.
+  async function deliverImage(record) {
+    if (sessionController === undefined) return false
+    const sessionId = await refreshMainSession()
+    if (sessionId === undefined) {
+      log('warn', 'no Main Bot chat to deliver to')
+      return false
+    }
+    const key = record.archiveKey
+    let saved = key === undefined ? undefined : archived.get(key)
+    if (saved === undefined) {
+      saved = await saveImageFile(record.bytes)
+      log('info', `image saved to ${saved.path} (${saved.bytes} bytes)`)
+      if (key !== undefined) {
+        archived.set(key, saved)
+        // Map iterates in insertion order, so the first key is the oldest.
+        while (archived.size > IMAGE_ARCHIVE_MEMORY) archived.delete(archived.keys().next().value)
+      }
+    } else {
+      log('info', `image already archived at ${saved.path}, retrying delivery only`)
+    }
+    await sessionController.prompt({
+      requestId: randomUUID(),
+      sessionId,
+      mode: 'queue',
+      content: [
+        { type: 'text', text: `${options.prefix} [图片] 已保存：${saved.path}` },
+        { type: 'image', mediaType: saved.format.mediaType, data: record.bytes.toString('base64'), name: saved.name },
+      ],
+    }, AbortSignal.timeout(30_000))
+    return true
+  }
+
   async function tick() {
     if (stopped || ticking) return
     ticking = true
@@ -403,6 +614,64 @@ function install(ctx, config = {}) {
       for (const item of fresh) {
         const id = String(item?.message_id ?? '')
         const time = Number(item?.create_time) || 0
+        // A person's picture is archived and announced; the cursor only advances once it
+        // has been. A failure is classified so one bad picture can never freeze the rest:
+        //   - permanent (4xx: recalled, expired, stale key) → warn and skip, cursor moves on
+        //   - transient (network, 5xx) → stop this batch and retry on the next poll
+        //   - repeated transient → after IMAGE_MAX_ATTEMPTS, give up and move on
+        // Either way the text path is untouched, and the next message is never blocked.
+        if (isUserImage(item)) {
+          try {
+            const fileKey = imageKeyOf(item)
+            const bytes = await downloadImage(id, fileKey)
+            const ok = await deliverImage({ bytes, time, id, archiveKey: `${id}/${fileKey}` })
+            if (!ok) break
+            cursor = time
+            if (id !== '') { seen.add(id); imageFailures.delete(id) }
+          } catch (error) {
+            const reason = error?.message ?? error
+            const attempts = (imageFailures.get(id) ?? 0) + 1
+            const giveUp = isPermanentImageError(error) || attempts >= IMAGE_MAX_ATTEMPTS
+            if (!giveUp) {
+              imageFailures.set(id, attempts)
+              log('warn', `image from ${id || '(unknown id)'} not archived (attempt ${attempts}/${IMAGE_MAX_ATTEMPTS}, will retry): ${reason}`)
+              break
+            }
+            log('warn', `image from ${id || '(unknown id)'} skipped after ${attempts} attempt(s): ${reason}`)
+            cursor = time
+            if (id !== '') { seen.add(id); imageFailures.delete(id) }
+          }
+          continue
+        }
+        // A rich-text message may embed pictures. They are archived like a plain image
+        // message; a post with no image, or one whose shape we do not recognise, falls
+        // through to the text path unchanged.
+        if (item?.sender?.sender_type === 'user' && item?.msg_type === 'post') {
+          const keys = postImageKeys(item)
+          if (keys.length > 0) {
+            try {
+              for (const key of keys) {
+                const bytes = await downloadImage(id, key)
+                await deliverImage({ bytes, time, id, archiveKey: `${id}/${key}` })
+              }
+              cursor = time
+              if (id !== '') { seen.add(id); imageFailures.delete(id) }
+            } catch (error) {
+              const reason = error?.message ?? error
+              const attempts = (imageFailures.get(id) ?? 0) + 1
+              const giveUp = isPermanentImageError(error) || attempts >= IMAGE_MAX_ATTEMPTS
+              if (!giveUp) {
+                imageFailures.set(id, attempts)
+                log('warn', `post images from ${id || '(unknown id)'} not archived (attempt ${attempts}/${IMAGE_MAX_ATTEMPTS}, will retry): ${reason}`)
+                break
+              }
+              log('warn', `post images from ${id || '(unknown id)'} skipped after ${attempts} attempt(s): ${reason}`)
+              cursor = time
+              if (id !== '') { seen.add(id); imageFailures.delete(id) }
+            }
+            continue
+          }
+        }
         // Anything that is not the user's own text (a system notice, a card, the Bot's
         // own echo) advances the cursor without being delivered.
         if (!isUserText(item)) {
