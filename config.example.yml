@@ -12,16 +12,23 @@
 #   两者都空 → 桥接关闭并打 warn。
 #   一句话：config 优先，环境变量只是 config 为空时的兜底，不存在反向覆盖。
 #
-# ⚠️ 下面两行的占位符必须先替换成真值。它们不是空串，直接照抄会被当成真值
-#    拿去做鉴权，结果是「鉴权失败」而不是「未配置」——排错方向会被带偏。
+# ⚠️ 下面 appId / chatId 故意留成空串，而不是写成「cli_your_app_id_here」这类非空占位符：
+#    代码只判「是否非空」、不校验格式，照抄一个非空假值会被当成真值拿去做鉴权，
+#    桥接不会报「未配置」，只会报鉴权失败，排错方向会被带偏。
+#    留空 = 安全默认（桥接关闭 + 一条 warn）。要用时把值换成真值即可。
 #    真实格式：appId 形如 cli_xxxxxxxxxxxxxxxx，chatId 形如 oc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 - id: feishu-bridge
   name: feishu-bridge
   config:
-    appId: cli_your_app_id_here
-    chatId: oc_your_chat_id_here
+    # 飞书自建应用 App ID（cli_ 开头）。留空则桥接不启动（只打 warn）。
+    appId: ""
+    # 飞书群 chat_id（oc_ 开头）。留空则桥接不启动（只打 warn）。
+    chatId: ""
     # 存 App Secret 的凭据条目名（DSH 凭据库里的 ref 名，不是环境变量名）。
     # 可省略，省略时默认 FEISHU_APP_SECRET。
     secretName: FEISHU_APP_SECRET
     pollSeconds: 10
+    # 群图片归档目录（可选）。省略时默认 ~/.dsh/Pic；每张图片只写到这一个目录。
+    # 想让图片落在别处（例如原来的 D:\Code\Life\Pic）就取消注释并改值：
+    #picDir: D:\Code\Life\Pic
