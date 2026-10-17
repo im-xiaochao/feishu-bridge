@@ -699,6 +699,8 @@ function install(ctx, config = {}) {
     const to = privateChat()
     if (to === undefined || to === from) return
     const where = from === options.chatId ? '群聊' : '私聊'
+    // Who spoke in the Feishu turn: the user wrote in Feishu, so "你" is right — but the
+    // question note format may also carry a Bot name from a forwarded request.
     const lines = []
     if (typeof asked === 'string' && asked.trim() !== '') lines.push(`**你（在${where}）：**\n${asked.trim()}`)
     if (typeof answer === 'string' && answer.trim() !== '') lines.push(`**我：**\n${answer.trim()}`)
@@ -736,6 +738,33 @@ function install(ctx, config = {}) {
   // Cut such notices off a message, keeping what the user typed. They are appended as whole
   // lines, so the cut is made at the first line that opens one — and a user's own words
   // never start that way.
+  // A message one Bot hands the Main Bot arrives in its own fixed shapes:
+  //   [Message from <Bot>] …                  a request, sometimes with a · note
+  //   [Reply from <Bot>] …                    the answer that closes it
+  //   [Group chat <chat> · from <Bot>] …      a group round, the speaker after "from"
+  //   [Group chat <chat> · the user …] …      the user speaking in that group
+  // These are not the user's words, and mirroring one as "我在 DSH 里说" puts another
+  // Bot's voice in the user's mouth. Returns who spoke, when the text is one of them.
+  const AGENT_FROM = /^\[(?:Message from|Reply from)\s+([^\]·]+?)\s*(?:·[^\]]*)?\]/
+  const GROUP_ROUND = /^\[Group chat\s+([^\]·]+?)\s*(?:·\s*([^\]]*))?\]/
+  const agentSender = (text) => {
+    const lead = text.trim()
+    const direct = AGENT_FROM.exec(lead)
+    if (direct) return direct[1].trim()
+    const group = GROUP_ROUND.exec(lead)
+    if (!group) return undefined
+    // `· from <Bot>` names the Bot; `· the user sees your reply here` is the user himself.
+    const speaker = /^from\s+(.+)$/i.exec((group[2] ?? '').trim())
+    if (speaker) return speaker[1].trim()
+    return group[2] === undefined ? group[1].trim() : undefined
+  }
+  // Long cards carry one header per part, so a split message stays attributed.
+  const splitParts = (body, max) => {
+    const parts = []
+    for (let index = 0; index < body.length; index += max) parts.push(body.slice(index, index + max))
+    return parts.length === 0 ? [''] : parts
+  }
+
   const NOTICE_LINE = /^(<system-reminder>|current runtime context\.|time sampled while preparing|the available skill catalog changed|instructions from:|\[?(current time|当前时间))/i
   const stripSynthetic = (text) => {
     const lines = text.split('\n')
@@ -748,18 +777,22 @@ function install(ctx, config = {}) {
     if (isFromFeishu(text.trim())) return
     // Keep only what the user typed: injected notices are cut off, and a message that was
     // nothing but notices leaves nothing to send.
+    // A turn is opened not only by the user typing in DSH: another Bot's request, reply
+    // or a group round opens one too. Those are attributed to that Bot, never to the user.
+    const sender = agentSender(text)
     const body = stripSynthetic(text)
     if (body === '') return
     const parts = chunk(body)
     for (let index = 0; index < parts.length; index++) {
       // The header marks the card as the user's own words, which is what tells it apart
       // from the Bot's replies; a long message numbers its parts instead of repeating it.
+      const who = sender === undefined ? '我在 DSH 里说' : `${sender} 发来`
       const title = parts.length === 1
-        ? '我在 DSH 里说'
-        : `我在 DSH 里说（${index + 1}/${parts.length}）`
+        ? who
+        : `${who}（${index + 1}/${parts.length}）`
       const card = {
         config: { wide_screen_mode: true },
-        header: { template: 'grey', title: { tag: 'plain_text', content: title } },
+        header: { template: sender === undefined ? 'grey' : 'blue', title: { tag: 'plain_text', content: title } },
         elements: [{ tag: 'markdown', content: parts[index] }],
       }
       const response = await fetch(`${API}/im/v1/messages?receive_id_type=chat_id`, {
