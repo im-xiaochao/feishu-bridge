@@ -54,7 +54,12 @@ export const Config = z.object({
   botStatePath: z.string().default(join(HOME, 'bot', 'state.json')),
   cursorPath: z.string().default(join(HOME, 'bot', 'feishu-bridge-cursor.json')),
   batchMax: z.number().default(10),
+  // The mark a group message carries. Kept configurable for older installs that already
+  // filter on it; a direct message gets `directPrefix` instead, so the Bot can tell the two
+  // apart at a glance. Both must start with a non-empty bracket so the delivered turn is
+  // still recognised as coming from Feishu (see onSessionEvent).
   prefix: z.string().default('[飞书群消息]'),
+  directPrefix: z.string().default('[飞书私聊消息]'),
 })
 
 // Where the pre-credentials secret store lives. Kept as a module constant rather than a
@@ -75,6 +80,7 @@ const CONFIG_KEYS = [
   'picDir',
   'batchMax',
   'prefix',
+  'directPrefix',
 ]
 
 // Fallbacks used when a key is absent from the resolved config — e.g. a profile that
@@ -92,6 +98,7 @@ const FALLBACKS = {
   picDir: join(HOME, 'Pic'),
   batchMax: 10,
   prefix: '[飞书群消息]',
+  directPrefix: '[飞书私聊消息]',
 }
 
 // A volatile field resolves to a wrapper; read it with `.get()` where it is one, and
@@ -278,6 +285,13 @@ function install(ctx, config = {}) {
   const log = (level, message) => {
     try { ctx?.logger?.[level]?.(`feishu-bridge: ${message}`) } catch { /* logging must never break the host */ }
   }
+  // The mark a delivered message carries, so the Bot (and the user reading the DSH chat)
+  // can tell a group message from a direct one at a glance. Both marks are recognised as
+  // coming from Feishu, which is what routes the reply back — see isFromFeishu().
+  const markOf = (from) => (from === 'direct' ? options.directPrefix : options.prefix)
+  // Every mark the bridge may deliver with. A delivered turn is recognised by any of them.
+  const feishuMarks = () => [options.prefix, options.directPrefix].filter(m => typeof m === 'string' && m !== '')
+  const isFromFeishu = (text) => feishuMarks().some(mark => text.startsWith(mark))
   if (typeof options.appId !== 'string' || options.appId === ''
     || typeof options.chatId !== 'string' || options.chatId === '') {
     log('warn', 'appId and chatId are required; the bridge stays off')
@@ -577,7 +591,8 @@ function install(ctx, config = {}) {
   // prefixed delivery coming back around: that one already exists in the group.
   async function sendUserMirror(text) {
     const body = text.trim()
-    if (body === '' || body.startsWith(options.prefix)) return
+    // Either mark means this already exists in Feishu — never echo it back.
+    if (body === '' || isFromFeishu(body)) return
     // DSH's time-context plugin injects a short clock line right after the real message;
     // it is not something the user wrote and would only be noise in the group.
     if (/^\[?(current time|当前时间)/i.test(body) && body.length < 200) return
@@ -657,7 +672,7 @@ function install(ctx, config = {}) {
       requestId: randomUUID(),
       sessionId,
       mode: deliveryMode(),
-      content: [{ type: 'text', text: `${options.prefix} ${record.text}` }],
+      content: [{ type: 'text', text: `${markOf(record.from)} ${record.text}` }],
     }, AbortSignal.timeout(30_000))
     return true
   }
@@ -706,7 +721,7 @@ function install(ctx, config = {}) {
       sessionId,
       mode: deliveryMode(),
       content: [
-        { type: 'text', text: `${options.prefix} [图片] 已保存：${saved.path}` },
+        { type: 'text', text: `${markOf(record.from)} [图片] 已保存：${saved.path}` },
         { type: 'image', mediaType: saved.format.mediaType, data: record.bytes.toString('base64'), name: saved.name },
       ],
     }, AbortSignal.timeout(30_000))
@@ -866,8 +881,10 @@ function install(ctx, config = {}) {
     // group's first turn be taken for the private chat and mirrored into the group. So a
     // turn is ignored until that id is known, and the poll that fills it runs at apply.
     const isMain = mainSession !== undefined && id === mainSession
+    // Either mark counts: a group delivery and a direct one both come from the bridge, and
+    // the reply is routed back by the conversation recorded when it was delivered.
     const isPrefixed = event?.type === 'user/message'
-      && blocksToText(event.data?.content).startsWith(options.prefix)
+      && isFromFeishu(blocksToText(event.data?.content))
     // A prefixed message is proof enough before the id is known: nothing else delivers it.
     if (!isMain && !(isPrefixed && mainSession === undefined)) return
     if (!isMain) mainSession = id
