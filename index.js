@@ -292,6 +292,20 @@ function install(ctx, config = {}) {
   // Every mark the bridge may deliver with. A delivered turn is recognised by any of them.
   const feishuMarks = () => [options.prefix, options.directPrefix].filter(m => typeof m === 'string' && m !== '')
   const isFromFeishu = (text) => feishuMarks().some(mark => text.startsWith(mark))
+  // Where unsolicited output goes — a DSH turn mirrored out, or a reply whose own
+  // The direct chat the whole conversation is copied to: every turn — one opened in DSH,
+  // one opened in the group, one opened in a direct chat — leaves a copy here, so the
+  // phone shows one continuous record. Undefined when no direct chat is configured.
+  const privateChat = () => (Array.isArray(options.directChatIds) && options.directChatIds.length > 0
+    ? options.directChatIds[0]
+    : undefined)
+  // Where unsolicited output goes — a turn the user opened in DSH has no Feishu message
+  // behind it. The private chat when there is one, the group otherwise.
+  const mirrorTo = () => privateChat() ?? options.chatId
+  // Where the answer to one delivered message goes: back to the conversation that asked.
+  // A question written in the group is answered in the group; a private one privately.
+  // The copy in the private chat is sendPrivateCopy()'s job, not this one's.
+  const replyTarget = (record) => (record.from === 'direct' ? record.chatId : options.chatId)
   if (typeof options.appId !== 'string' || options.appId === ''
     || typeof options.chatId !== 'string' || options.chatId === '') {
     log('warn', 'appId and chatId are required; the bridge stays off')
@@ -354,6 +368,9 @@ function install(ctx, config = {}) {
   // chat stays direct: answering it into the group would publish a private word.
   let replyTo
   let replyFrom = 'group'
+  // What the user wrote in the message that opened this turn, so the private copy can show
+  // the question next to the answer.
+  let turnAsked = ''
 
   async function readJson(path, fallback) {
     try {
@@ -554,15 +571,104 @@ function install(ctx, config = {}) {
     return { path: target, name, format, bytes: bytes.length }
   }
 
+  // Feishu's card markdown does not render pipe tables: it shows the pipes as typed. So a
+  // table is lifted out of the reply and posted as the card's own table element, and the
+  // prose around it stays in markdown elements. Everything the Bot writes keeps looking as
+  // it should, and a reply with no table is unchanged.
+  //
+  // A table is a header row, a delimiter row of dashes, and its body rows, all starting and
+  // ending with a pipe. Only that shape is taken; anything looser is left as markdown.
+  const TABLE_DELIMITER = /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/
+  function splitTableRow(line) {
+    const trimmed = line.trim().replace(/^\|/, '').replace(/\|$/, '')
+    return trimmed.split('|').map(cell => cell.trim())
+  }
+  // One cell's markdown, flattened for the table element, which takes plain text.
+  function cellText(markdown) {
+    return markdown
+      .replace(/\*\*(.+?)\*\*/g, '$1')
+      .replace(/`([^`]*)`/g, '$1')
+      .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+      .replace(/<br\s*\/?>/gi, ' ')
+      .replace(/^_+|_+$/g, '')
+      .trim()
+  }
+  function tableElement(header, rows) {
+    return {
+      tag: 'table',
+      page_size: Math.max(5, rows.length),
+      row_height: 'low',
+      header_style: {
+        text_align: 'left',
+        text_size: 'normal',
+        background_style: 'grey',
+        bold: true,
+        lines: 1,
+      },
+      columns: header.map((name, index) => ({
+        name: `c${index}`,
+        display_name: cellText(name) || `列${index + 1}`,
+        data_type: 'text',
+        horizontal_align: 'left',
+        width: 'auto',
+      })),
+      rows: rows.map(cells => Object.fromEntries(
+        header.map((_, index) => [`c${index}`, cellText(cells[index] ?? '')]),
+      )),
+    }
+  }
+  // The reply as card elements: prose runs as markdown, each table as a table element.
+  function cardElements(text) {
+    const lines = text.split('\n')
+    const elements = []
+    let prose = []
+    const flushProse = () => {
+      const joined = prose.join('\n').trim()
+      if (joined !== '') elements.push({ tag: 'markdown', content: joined })
+      prose = []
+    }
+    for (let index = 0; index < lines.length; index++) {
+      const line = lines[index]
+      const next = lines[index + 1]
+      const isTable = line.trim().startsWith('|') && typeof next === 'string' && TABLE_DELIMITER.test(next)
+      if (!isTable) {
+        prose.push(line)
+        continue
+      }
+      // Collect the body: every following line that still opens or closes with a pipe.
+      const header = splitTableRow(line)
+      const rows = []
+      let cursor = index + 2
+      for (; cursor < lines.length; cursor++) {
+        const row = lines[cursor]
+        if (!row.trim().startsWith('|')) break
+        rows.push(splitTableRow(row))
+      }
+      // A header with no body is not a table worth rendering — leave it as written.
+      if (rows.length === 0) {
+        prose.push(line)
+        continue
+      }
+      flushProse()
+      elements.push(tableElement(header, rows))
+      index = cursor - 1
+    }
+    flushProse()
+    return elements.length > 0 ? elements : [{ tag: 'markdown', content: text }]
+  }
+
   // Post one reply back to the conversation the question came from — the group for a group
   // message, the direct chat for a direct one — so a private word never lands in the group.
   // A card with a markdown element renders the reply's own formatting (bold, lists, links,
-  // code), which a plain text message would show as literal asterisks and pipes.
+  // code), which a plain text message would show as literal asterisks and pipes; a table is
+  // posted as the card's own table element, see cardElements().
   async function send(text, to = options.chatId) {
+    // Split on size first, so a very long reply still arrives in card-sized parts, then turn
+    // each part's tables into elements.
     for (const part of chunk(text)) {
       const card = {
         config: { wide_screen_mode: true },
-        elements: [{ tag: 'markdown', content: part }],
+        elements: cardElements(part),
       }
       const response = await fetch(`${API}/im/v1/messages?receive_id_type=chat_id`, {
         method: 'POST',
@@ -582,6 +688,39 @@ function install(ctx, config = {}) {
     }
   }
 
+  // Copy one finished turn into the private chat, so the phone keeps a single record of the
+  // whole conversation: what was said in a group, what the Bot answered there, and what was
+  // said at the desk. The copy names the conversation it came from, and is skipped when the
+  // turn happened in the private chat itself — it is already there.
+  //
+  // `asked` is what the user wrote (undefined when the turn has no user line of its own);
+  // `answer` is the Bot's reply. Either may be empty. Nothing is copied when both are.
+  async function sendPrivateCopy(from, asked, answer) {
+    const to = privateChat()
+    if (to === undefined || to === from) return
+    const where = from === options.chatId ? '群聊' : '私聊'
+    const lines = []
+    if (typeof asked === 'string' && asked.trim() !== '') lines.push(`**你（在${where}）：**\n${asked.trim()}`)
+    if (typeof answer === 'string' && answer.trim() !== '') lines.push(`**我：**\n${answer.trim()}`)
+    if (lines.length === 0) return
+    const card = {
+      config: { wide_screen_mode: true },
+      header: { template: 'grey', title: { tag: 'plain_text', content: `聊天记录同步（来自${where}）` } },
+      elements: lines.map(content => ({ tag: 'markdown', content })),
+    }
+    const response = await fetch(`${API}/im/v1/messages?receive_id_type=chat_id`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${await accessToken()}`,
+        'Content-Type': 'application/json; charset=utf-8',
+      },
+      body: JSON.stringify({ receive_id: to, msg_type: 'interactive', content: JSON.stringify(card) }),
+      signal: AbortSignal.timeout(20_000),
+    })
+    const sent = await response.json().catch(() => ({}))
+    if (sent?.code !== 0) throw new Error(`private copy refused (code ${sent?.code ?? '?'})`)
+  }
+
   // Mirror one message the user typed in DSH into the group, so the phone sees both halves
   // of the conversation. It goes as its own card marked as coming from DSH, which keeps it
   // apart from the Bot's replies (those have no such header) and from anything the user
@@ -589,13 +728,28 @@ function install(ctx, config = {}) {
   //
   // A message is skipped when it is DSH's own synthetic clock, or when it is the bridge's
   // prefixed delivery coming back around: that one already exists in the group.
+  // DSH injects system messages into a Session as if they were user messages: a running
+  // clock, a changed skill catalogue, a snapshot of the runtime context. None of them is
+  // something the user typed, and mirroring one puts build noise in the user's phone. They
+  // are told apart by how the line opens, which the plugins write in a fixed shape.
+  //
+  // Cut such notices off a message, keeping what the user typed. They are appended as whole
+  // lines, so the cut is made at the first line that opens one — and a user's own words
+  // never start that way.
+  const NOTICE_LINE = /^(<system-reminder>|current runtime context\.|time sampled while preparing|the available skill catalog changed|instructions from:|\[?(current time|当前时间))/i
+  const stripSynthetic = (text) => {
+    const lines = text.split('\n')
+    const cut = lines.findIndex(line => NOTICE_LINE.test(line.trim()))
+    return (cut === -1 ? text : lines.slice(0, cut).join('\n')).trim()
+  }
+
   async function sendUserMirror(text) {
-    const body = text.trim()
     // Either mark means this already exists in Feishu — never echo it back.
-    if (body === '' || isFromFeishu(body)) return
-    // DSH's time-context plugin injects a short clock line right after the real message;
-    // it is not something the user wrote and would only be noise in the group.
-    if (/^\[?(current time|当前时间)/i.test(body) && body.length < 200) return
+    if (isFromFeishu(text.trim())) return
+    // Keep only what the user typed: injected notices are cut off, and a message that was
+    // nothing but notices leaves nothing to send.
+    const body = stripSynthetic(text)
+    if (body === '') return
     const parts = chunk(body)
     for (let index = 0; index < parts.length; index++) {
       // The header marks the card as the user's own words, which is what tells it apart
@@ -615,7 +769,7 @@ function install(ctx, config = {}) {
           'Content-Type': 'application/json; charset=utf-8',
         },
         body: JSON.stringify({
-          receive_id: options.chatId,
+          receive_id: mirrorTo(),
           msg_type: 'interactive',
           content: JSON.stringify(card),
         }),
@@ -664,10 +818,11 @@ function install(ctx, config = {}) {
       log('warn', 'no Main Bot chat to deliver to')
       return false
     }
-    // Remember which conversation asked, so the answer goes back there: a direct message
-    // must never be answered into the group. Cleared when the turn ends.
-    replyTo = record.from === 'direct' ? record.chatId : options.chatId
+    // The answer goes back to the conversation that asked. The private chat additionally
+    // keeps a copy of every turn — that is sendPrivateCopy()'s job at turn/end.
+    replyTo = replyTarget(record)
     replyFrom = record.from ?? 'group'
+    turnAsked = record.text ?? ''
     await sessionController.prompt({
       requestId: randomUUID(),
       sessionId,
@@ -713,9 +868,10 @@ function install(ctx, config = {}) {
     } else {
       log('info', `image already archived at ${saved.path}, retrying delivery only`)
     }
-    // Remember which conversation asked, so the answer goes back there.
-    replyTo = record.from === 'direct' ? record.chatId : options.chatId
+    // Same routing as a text message: the answer goes back to the conversation that asked.
+    replyTo = replyTarget(record)
     replyFrom = record.from ?? 'group'
+    turnAsked = '[图片]'
     await sessionController.prompt({
       requestId: randomUUID(),
       sessionId,
@@ -906,6 +1062,7 @@ function install(ctx, config = {}) {
           // The user typed in DSH: mirrored to the group as well, so the phone sees it,
           // and the reply that closes this turn is mirrored too.
           feishuPending = true
+          turnAsked = ''
           const typed = blocksToText(event.data?.content)
           if (typed.trim() !== '') {
             void sendUserMirror(typed).catch(error => log('warn', `mirror send failed: ${error?.message ?? error}`))
@@ -924,10 +1081,13 @@ function install(ctx, config = {}) {
         const owed = feishuPending
         const text = turnTexts.join('\n\n').trim()
         // The conversation to answer: whichever one opened this turn. A turn the user
-        // opened in DSH has no Feishu message behind it, so it mirrors to the group.
-        const target = replyTo ?? options.chatId
-        const direct = replyFrom === 'direct'
+        // opened in DSH has no Feishu message behind it, so it goes to mirrorTo() — the
+        // private chat when one is configured, the group otherwise.
+        const target = replyTo ?? mirrorTo()
+        const source = replyFrom ?? 'group'
+        const asked = turnAsked
         turnTexts = []
+        turnAsked = ''
         feishuPending = false
         turnRunning = false
         turnOwner = undefined
@@ -935,6 +1095,13 @@ function install(ctx, config = {}) {
         replyFrom = 'group'
         if (owed && text !== '') {
           void send(text, target).catch(error => log('warn', `reply send failed: ${error?.message ?? error}`))
+        }
+        // Every turn also leaves a copy in the private chat, so the phone keeps one record
+        // of the whole conversation — a group exchange included. A turn that happened in
+        // the private chat is already there, and sendPrivateCopy() skips it.
+        if (owed) {
+          void sendPrivateCopy(target, asked, text)
+            .catch(error => log('warn', `private copy failed: ${error?.message ?? error}`))
         }
         break
       }
