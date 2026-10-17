@@ -25,6 +25,15 @@
     appId: ""
     # 飞书群 chat_id（oc_ 开头）。留空则桥接不启动（只打 warn）。
     chatId: ""
+    # 要监听的飞书私聊 chat_id 列表（oc_ 开头），可选。
+    # 飞书的会话列表接口只返回群、不返回私聊，所以每个私聊都必须写在这里；
+    # 不填 = 只接群，私聊消息收不到（这是默认行为）。
+    # 怎么拿到私聊 chat_id：先让机器人给你发一条私聊，POST /open-apis/im/v1/messages
+    # （receive_id_type=open_id）的响应里 data.chat_id 就是。详见 README「私聊」一节。
+    # 需要额外权限 im:message.p2p_msg:readonly。
+    # 也可用环境变量 FEISHU_BRIDGE_DIRECT_CHAT_IDS（逗号分隔），那种方式不进仓库。
+    #directChatIds:
+    #  - oc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
     # 存 App Secret 的凭据条目名（DSH 凭据库里的 ref 名，不是环境变量名）。
     # 可省略，省略时默认 FEISHU_APP_SECRET。
     secretName: FEISHU_APP_SECRET

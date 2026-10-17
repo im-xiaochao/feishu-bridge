@@ -43,6 +43,8 @@ export const Config = z.object({
     .description('飞书自建应用 App ID（cli_ 开头），留空则不启动桥接'),
   chatId: z.string().default('').volatile()
     .description('飞书群 chat_id（oc_ 开头），留空则不启动桥接'),
+  directChatIds: z.array(z.string()).default([]).volatile()
+    .description('要监听的飞书私聊 chat_id 列表（oc_ 开头）。飞书的会话列表接口不返回私聊，所以每个私聊都得写在这里'),
   secretName: z.string().default('FEISHU_APP_SECRET').volatile()
     .description('存放 App Secret 的凭据条目名（不是环境变量名）'),
   pollSeconds: z.number().default(10).volatile()
@@ -65,6 +67,7 @@ const LEGACY_SECRETS_PATH = join(HOME, 'bot', 'secrets.json')
 const CONFIG_KEYS = [
   'appId',
   'chatId',
+  'directChatIds',
   'secretName',
   'botStatePath',
   'cursorPath',
@@ -81,6 +84,7 @@ const CONFIG_KEYS = [
 const FALLBACKS = {
   appId: '',
   chatId: '',
+  directChatIds: [],
   secretName: 'FEISHU_APP_SECRET',
   botStatePath: join(HOME, 'bot', 'state.json'),
   cursorPath: join(HOME, 'bot', 'feishu-bridge-cursor.json'),
@@ -264,6 +268,13 @@ function install(ctx, config = {}) {
   if (options.chatId === '' || options.chatId === undefined) {
     options.chatId = process.env.FEISHU_BRIDGE_CHAT_ID ?? options.chatId
   }
+  // 私聊列表可以走环境变量（逗号分隔），方便本机配置不进仓库。
+  if ((!Array.isArray(options.directChatIds) || options.directChatIds.length === 0)
+    && typeof process.env.FEISHU_BRIDGE_DIRECT_CHAT_IDS === 'string'
+    && process.env.FEISHU_BRIDGE_DIRECT_CHAT_IDS !== '') {
+    options.directChatIds = process.env.FEISHU_BRIDGE_DIRECT_CHAT_IDS.split(',').map(s => s.trim()).filter(Boolean)
+  }
+  if (!Array.isArray(options.directChatIds)) options.directChatIds = []
   const log = (level, message) => {
     try { ctx?.logger?.[level]?.(`feishu-bridge: ${message}`) } catch { /* logging must never break the host */ }
   }
@@ -325,6 +336,10 @@ function install(ctx, config = {}) {
   // DSH. This decides how a new Feishu message is delivered — see deliveryMode().
   let turnRunning = false
   let turnOwner
+  // Where the answer to the Feishu message that opened the current turn belongs. A direct
+  // chat stays direct: answering it into the group would publish a private word.
+  let replyTo
+  let replyFrom = 'group'
 
   async function readJson(path, fallback) {
     try {
@@ -341,11 +356,28 @@ function install(ctx, config = {}) {
     await rename(temporary, path)
   }
 
-  async function loadCursor() {
-    if (cursor !== null) return cursor
+  // One cursor per conversation. The group keeps the key the file has always used, so an
+  // existing install carries on from where it was; each direct chat gets its own entry.
+  async function loadCursor(chatId = options.chatId) {
+    if (chatId === options.chatId && cursor !== null) return cursor
     const saved = await readJson(options.cursorPath, null)
-    cursor = typeof saved?.lastCreateTime === 'number' ? saved.lastCreateTime : null
-    return cursor
+    const value = chatId === options.chatId
+      ? (typeof saved?.lastCreateTime === 'number' ? saved.lastCreateTime : null)
+      : (typeof saved?.direct?.[chatId] === 'number' ? saved.direct[chatId] : null)
+    if (chatId === options.chatId) cursor = value
+    return value
+  }
+
+  async function saveCursor(chatId, value) {
+    const saved = await readJson(options.cursorPath, null)
+    const direct = { ...(saved?.direct ?? {}) }
+    if (chatId === options.chatId) {
+      cursor = value
+      await writeJson(options.cursorPath, { ...(saved ?? {}), lastCreateTime: value, chatId: options.chatId, direct })
+      return
+    }
+    direct[chatId] = value
+    await writeJson(options.cursorPath, { ...(saved ?? {}), direct })
   }
 
   // App Secret 先走 DSH 官方凭据 seam（ctx.credentials.resolve，键名由 secretName 指定），
@@ -421,8 +453,34 @@ function install(ctx, config = {}) {
     return token
   }
 
-  async function messages() {
-    const url = `${API}/im/v1/messages?container_id_type=chat&container_id=${encodeURIComponent(options.chatId)}`
+  // The Bot's direct chats. Feishu's chat list only returns the groups a Bot belongs to,
+  // never its one-to-one chats, so they cannot be discovered — each must be configured.
+  // The list is read here and folded into openDirectChats() below.
+  async function directChats() {
+    const configured = Array.isArray(options.directChatIds)
+      ? options.directChatIds.filter(id => typeof id === 'string' && id !== '')
+      : []
+    if (configured.length > 0) return configured.map(chatId => ({ chat_id: chatId }))
+    // Fallback: try the chat list anyway, in case a later Feishu version includes them.
+    try {
+      const url = `${API}/im/v1/chats?page_size=50`
+      const response = await fetch(url, {
+        headers: { Authorization: `Bearer ${await accessToken()}` },
+        signal: AbortSignal.timeout(20_000),
+      })
+      const body = await response.json().catch(() => ({}))
+      if (body?.code !== 0) return []
+      const items = Array.isArray(body?.data?.items) ? body.data.items : []
+      return items.filter(item => item?.chat_mode === 'p2p' && typeof item?.chat_id === 'string')
+    } catch {
+      return []
+    }
+  }
+
+  // Messages in one conversation, group or direct. The endpoint is the same; only the
+  // container differs, and the caller decides what to do with what comes back.
+  async function messagesIn(chatId) {
+    const url = `${API}/im/v1/messages?container_id_type=chat&container_id=${encodeURIComponent(chatId)}`
       + '&sort_type=ByCreateTimeDesc&page_size=20'
     const response = await fetch(url, {
       headers: { Authorization: `Bearer ${await accessToken()}` },
@@ -482,14 +540,58 @@ function install(ctx, config = {}) {
     return { path: target, name, format, bytes: bytes.length }
   }
 
-  // Post one reply into the group. A card with a markdown element renders the reply's
-  // own formatting (bold, lists, links, code), which a plain text message would show as
-  // literal asterisks and pipes.
-  async function send(text) {
+  // Post one reply back to the conversation the question came from — the group for a group
+  // message, the direct chat for a direct one — so a private word never lands in the group.
+  // A card with a markdown element renders the reply's own formatting (bold, lists, links,
+  // code), which a plain text message would show as literal asterisks and pipes.
+  async function send(text, to = options.chatId) {
     for (const part of chunk(text)) {
       const card = {
         config: { wide_screen_mode: true },
         elements: [{ tag: 'markdown', content: part }],
+      }
+      const response = await fetch(`${API}/im/v1/messages?receive_id_type=chat_id`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${await accessToken()}`,
+          'Content-Type': 'application/json; charset=utf-8',
+        },
+        body: JSON.stringify({
+          receive_id: to,
+          msg_type: 'interactive',
+          content: JSON.stringify(card),
+        }),
+        signal: AbortSignal.timeout(20_000),
+      })
+      const body = await response.json().catch(() => ({}))
+      if (body?.code !== 0) throw new Error(`send refused (code ${body?.code ?? '?'})`)
+    }
+  }
+
+  // Mirror one message the user typed in DSH into the group, so the phone sees both halves
+  // of the conversation. It goes as its own card marked as coming from DSH, which keeps it
+  // apart from the Bot's replies (those have no such header) and from anything the user
+  // writes in Feishu itself (delivered the other way, never echoed back).
+  //
+  // A message is skipped when it is DSH's own synthetic clock, or when it is the bridge's
+  // prefixed delivery coming back around: that one already exists in the group.
+  async function sendUserMirror(text) {
+    const body = text.trim()
+    if (body === '' || body.startsWith(options.prefix)) return
+    // DSH's time-context plugin injects a short clock line right after the real message;
+    // it is not something the user wrote and would only be noise in the group.
+    if (/^\[?(current time|当前时间)/i.test(body) && body.length < 200) return
+    const parts = chunk(body)
+    for (let index = 0; index < parts.length; index++) {
+      // The header marks the card as the user's own words, which is what tells it apart
+      // from the Bot's replies; a long message numbers its parts instead of repeating it.
+      const title = parts.length === 1
+        ? '我在 DSH 里说'
+        : `我在 DSH 里说（${index + 1}/${parts.length}）`
+      const card = {
+        config: { wide_screen_mode: true },
+        header: { template: 'grey', title: { tag: 'plain_text', content: title } },
+        elements: [{ tag: 'markdown', content: parts[index] }],
       }
       const response = await fetch(`${API}/im/v1/messages?receive_id_type=chat_id`, {
         method: 'POST',
@@ -504,8 +606,8 @@ function install(ctx, config = {}) {
         }),
         signal: AbortSignal.timeout(20_000),
       })
-      const body = await response.json().catch(() => ({}))
-      if (body?.code !== 0) throw new Error(`send refused (code ${body?.code ?? '?'})`)
+      const sent = await response.json().catch(() => ({}))
+      if (sent?.code !== 0) throw new Error(`mirror refused (code ${sent?.code ?? '?'})`)
     }
   }
 
@@ -547,6 +649,10 @@ function install(ctx, config = {}) {
       log('warn', 'no Main Bot chat to deliver to')
       return false
     }
+    // Remember which conversation asked, so the answer goes back there: a direct message
+    // must never be answered into the group. Cleared when the turn ends.
+    replyTo = record.from === 'direct' ? record.chatId : options.chatId
+    replyFrom = record.from ?? 'group'
     await sessionController.prompt({
       requestId: randomUUID(),
       sessionId,
@@ -592,6 +698,9 @@ function install(ctx, config = {}) {
     } else {
       log('info', `image already archived at ${saved.path}, retrying delivery only`)
     }
+    // Remember which conversation asked, so the answer goes back there.
+    replyTo = record.from === 'direct' ? record.chatId : options.chatId
+    replyFrom = record.from ?? 'group'
     await sessionController.prompt({
       requestId: randomUUID(),
       sessionId,
@@ -604,48 +713,76 @@ function install(ctx, config = {}) {
     return true
   }
 
-  async function tick() {
-    if (stopped || ticking) return
-    ticking = true
-    try {
-      const items = await messages()
-      await refreshMainSession()
-      const known = await loadCursor()
-      if (known === null) {
-        // First run: adopt the newest message so history is not replayed.
-        const newest = items.reduce((max, item) => Math.max(max, Number(item?.create_time) || 0), 0)
-        cursor = newest
-        await writeJson(options.cursorPath, { lastCreateTime: newest, chatId: options.chatId })
-        log('info', `cursor initialised at ${newest}`)
-        return
-      }
+  // Drain one conversation — the group or one direct chat — into the Main Bot's own chat.
+  // Returns the highest create_time it has finished with, so each conversation advances its
+  // own cursor: a picture that cannot be read in a direct chat must not hold the group's
+  // messages back, and the other way round.
+  async function drain(chatId, from) {
+    const items = await messagesIn(chatId)
+    const known = await loadCursor(chatId)
+    if (known === null) {
+      // First run for this conversation: adopt the newest message so history is not replayed.
+      const newest = items.reduce((max, item) => Math.max(max, Number(item?.create_time) || 0), 0)
+      await saveCursor(chatId, newest)
+      log('info', `cursor initialised for ${from} ${chatId} at ${newest}`)
+      return
+    }
+    let cursor = known
 
-      const fresh = items
-        .filter(item => {
-          const time = Number(item?.create_time) || 0
-          if (time <= cursor) return false
-          const id = item?.message_id
-          if (typeof id === 'string' && seen.has(id)) return false
-          return true
-        })
-        .sort((a, b) => (Number(a?.create_time) || 0) - (Number(b?.create_time) || 0))
-        .slice(0, options.batchMax)
-
-      for (const item of fresh) {
-        const id = String(item?.message_id ?? '')
+    const fresh = items
+      .filter(item => {
         const time = Number(item?.create_time) || 0
-        // A person's picture is archived and announced; the cursor only advances once it
-        // has been. A failure is classified so one bad picture can never freeze the rest:
-        //   - permanent (4xx: recalled, expired, stale key) → warn and skip, cursor moves on
-        //   - transient (network, 5xx) → stop this batch and retry on the next poll
-        //   - repeated transient → after IMAGE_MAX_ATTEMPTS, give up and move on
-        // Either way the text path is untouched, and the next message is never blocked.
-        if (isUserImage(item)) {
+        if (time <= cursor) return false
+        const id = item?.message_id
+        if (typeof id === 'string' && seen.has(id)) return false
+        return true
+      })
+      .sort((a, b) => (Number(a?.create_time) || 0) - (Number(b?.create_time) || 0))
+      .slice(0, options.batchMax)
+
+    for (const item of fresh) {
+      const id = String(item?.message_id ?? '')
+      const time = Number(item?.create_time) || 0
+      // A person's picture is archived and announced; the cursor only advances once it
+      // has been. A failure is classified so one bad picture can never freeze the rest:
+      //   - permanent (4xx: recalled, expired, stale key) → warn and skip, cursor moves on
+      //   - transient (network, 5xx) → stop this batch and retry on the next poll
+      //   - repeated transient → after IMAGE_MAX_ATTEMPTS, give up and move on
+      // Either way the text path is untouched, and the next message is never blocked.
+      if (isUserImage(item)) {
+        try {
+          const fileKey = imageKeyOf(item)
+          const bytes = await downloadImage(id, fileKey)
+          const ok = await deliverImage({ bytes, time, id, chatId, from, archiveKey: `${id}/${fileKey}` })
+          if (!ok) break
+          cursor = time
+          if (id !== '') { seen.add(id); imageFailures.delete(id) }
+        } catch (error) {
+          const reason = error?.message ?? error
+          const attempts = (imageFailures.get(id) ?? 0) + 1
+          const giveUp = isPermanentImageError(error) || attempts >= IMAGE_MAX_ATTEMPTS
+          if (!giveUp) {
+            imageFailures.set(id, attempts)
+            log('warn', `image from ${id || '(unknown id)'} not archived (attempt ${attempts}/${IMAGE_MAX_ATTEMPTS}, will retry): ${reason}`)
+            break
+          }
+          log('warn', `image from ${id || '(unknown id)'} skipped after ${attempts} attempt(s): ${reason}`)
+          cursor = time
+          if (id !== '') { seen.add(id); imageFailures.delete(id) }
+        }
+        continue
+      }
+      // A rich-text message may embed pictures. They are archived like a plain image
+      // message; a post with no image, or one whose shape we do not recognise, falls
+      // through to the text path unchanged.
+      if (item?.sender?.sender_type === 'user' && item?.msg_type === 'post') {
+        const keys = postImageKeys(item)
+        if (keys.length > 0) {
           try {
-            const fileKey = imageKeyOf(item)
-            const bytes = await downloadImage(id, fileKey)
-            const ok = await deliverImage({ bytes, time, id, archiveKey: `${id}/${fileKey}` })
-            if (!ok) break
+            for (const key of keys) {
+              const bytes = await downloadImage(id, key)
+              await deliverImage({ bytes, time, id, chatId, from, archiveKey: `${id}/${key}` })
+            }
             cursor = time
             if (id !== '') { seen.add(id); imageFailures.delete(id) }
           } catch (error) {
@@ -654,58 +791,55 @@ function install(ctx, config = {}) {
             const giveUp = isPermanentImageError(error) || attempts >= IMAGE_MAX_ATTEMPTS
             if (!giveUp) {
               imageFailures.set(id, attempts)
-              log('warn', `image from ${id || '(unknown id)'} not archived (attempt ${attempts}/${IMAGE_MAX_ATTEMPTS}, will retry): ${reason}`)
+              log('warn', `post images from ${id || '(unknown id)'} not archived (attempt ${attempts}/${IMAGE_MAX_ATTEMPTS}, will retry): ${reason}`)
               break
             }
-            log('warn', `image from ${id || '(unknown id)'} skipped after ${attempts} attempt(s): ${reason}`)
+            log('warn', `post images from ${id || '(unknown id)'} skipped after ${attempts} attempt(s): ${reason}`)
             cursor = time
             if (id !== '') { seen.add(id); imageFailures.delete(id) }
           }
           continue
         }
-        // A rich-text message may embed pictures. They are archived like a plain image
-        // message; a post with no image, or one whose shape we do not recognise, falls
-        // through to the text path unchanged.
-        if (item?.sender?.sender_type === 'user' && item?.msg_type === 'post') {
-          const keys = postImageKeys(item)
-          if (keys.length > 0) {
-            try {
-              for (const key of keys) {
-                const bytes = await downloadImage(id, key)
-                await deliverImage({ bytes, time, id, archiveKey: `${id}/${key}` })
-              }
-              cursor = time
-              if (id !== '') { seen.add(id); imageFailures.delete(id) }
-            } catch (error) {
-              const reason = error?.message ?? error
-              const attempts = (imageFailures.get(id) ?? 0) + 1
-              const giveUp = isPermanentImageError(error) || attempts >= IMAGE_MAX_ATTEMPTS
-              if (!giveUp) {
-                imageFailures.set(id, attempts)
-                log('warn', `post images from ${id || '(unknown id)'} not archived (attempt ${attempts}/${IMAGE_MAX_ATTEMPTS}, will retry): ${reason}`)
-                break
-              }
-              log('warn', `post images from ${id || '(unknown id)'} skipped after ${attempts} attempt(s): ${reason}`)
-              cursor = time
-              if (id !== '') { seen.add(id); imageFailures.delete(id) }
-            }
-            continue
-          }
-        }
-        // Anything that is not the user's own text (a system notice, a card, the Bot's
-        // own echo) advances the cursor without being delivered.
-        if (!isUserText(item)) {
-          cursor = time
-          if (id !== '') seen.add(id)
-          continue
-        }
-        const text = clean(textOf(item))
-        const ok = await deliver({ text, time, id })
-        if (!ok) break
+      }
+      // Anything that is not the user's own text (a system notice, a card, the Bot's
+      // own echo) advances the cursor without being delivered.
+      if (!isUserText(item)) {
         cursor = time
         if (id !== '') seen.add(id)
+        continue
       }
-      await writeJson(options.cursorPath, { lastCreateTime: cursor, chatId: options.chatId })
+      const text = clean(textOf(item))
+      const ok = await deliver({ text, time, id, chatId, from })
+      if (!ok) break
+      cursor = time
+      if (id !== '') seen.add(id)
+    }
+    if (cursor !== known) await saveCursor(chatId, cursor)
+  }
+
+  async function tick() {
+    if (stopped || ticking) return
+    ticking = true
+    try {
+      await refreshMainSession()
+      await drain(options.chatId, 'group')
+      // Direct chats are polled too, so a word sent to the Bot one-to-one is heard like one
+      // sent in the group. Each answers back into its own chat — see deliver()/send().
+      let chats = []
+      try {
+        chats = await directChats()
+      } catch (error) {
+        // A refused chat list must never stop the group from being read.
+        log('warn', `direct chat list failed: ${error?.message ?? error}`)
+      }
+      for (const chat of chats) {
+        if (stopped) break
+        try {
+          await drain(chat.chat_id, 'direct')
+        } catch (error) {
+          log('warn', `direct chat ${chat.chat_id} failed: ${error?.message ?? error}`)
+        }
+      }
     } catch (error) {
       log('warn', `poll failed: ${error?.message ?? error}`)
     } finally {
@@ -713,9 +847,11 @@ function install(ctx, config = {}) {
     }
   }
 
-  // The reply to a Feishu message goes back to the group. A turn is forwarded only when
-  // the message that opened it was one the bridge delivered, so a conversation typed in
-  // DSH stays in DSH.
+  // Both directions of the Main Bot's own chat reach the group: a turn opened by a Feishu
+  // message is answered there (as before), and a turn the user opened in DSH is mirrored to
+  // the group too, so the phone never misses what was said at the desk. Group chats the Bot
+  // takes part in are still not forwarded: their members talk among themselves, and that
+  // traffic has no place in this group.
   //
   // A turn receives more than one user/message: DSH's time-context plugin injects a
   // synthetic clock message right after the real one, and a message queued while a turn
@@ -725,12 +861,14 @@ function install(ctx, config = {}) {
   function onSessionEvent(session, event) {
     const id = session?.id
     if (typeof id !== 'string') return
-    // Only the Main Bot's own chat is answered. Before the first poll has resolved which
-    // Session that is, a message carrying the bridge's prefix is proof enough — nothing
-    // else delivers it — so a message arriving in that first moment is not dropped.
+    // Only the Main Bot's own chat is answered. `mainSession` comes from state.json, the
+    // one authoritative source: guessing it from whichever session speaks first would let a
+    // group's first turn be taken for the private chat and mirrored into the group. So a
+    // turn is ignored until that id is known, and the poll that fills it runs at apply.
     const isMain = mainSession !== undefined && id === mainSession
     const isPrefixed = event?.type === 'user/message'
       && blocksToText(event.data?.content).startsWith(options.prefix)
+    // A prefixed message is proof enough before the id is known: nothing else delivers it.
     if (!isMain && !(isPrefixed && mainSession === undefined)) return
     if (!isMain) mainSession = id
     switch (event?.type) {
@@ -747,6 +885,14 @@ function install(ctx, config = {}) {
           feishuPending = true
           // A steered or queued Feishu message is what opened this turn.
           turnOwner = 'feishu'
+        } else {
+          // The user typed in DSH: mirrored to the group as well, so the phone sees it,
+          // and the reply that closes this turn is mirrored too.
+          feishuPending = true
+          const typed = blocksToText(event.data?.content)
+          if (typed.trim() !== '') {
+            void sendUserMirror(typed).catch(error => log('warn', `mirror send failed: ${error?.message ?? error}`))
+          }
         }
         break
       }
@@ -760,12 +906,18 @@ function install(ctx, config = {}) {
       case 'turn/end': {
         const owed = feishuPending
         const text = turnTexts.join('\n\n').trim()
+        // The conversation to answer: whichever one opened this turn. A turn the user
+        // opened in DSH has no Feishu message behind it, so it mirrors to the group.
+        const target = replyTo ?? options.chatId
+        const direct = replyFrom === 'direct'
         turnTexts = []
         feishuPending = false
         turnRunning = false
         turnOwner = undefined
+        replyTo = undefined
+        replyFrom = 'group'
         if (owed && text !== '') {
-          void send(text).catch(error => log('warn', `reply send failed: ${error?.message ?? error}`))
+          void send(text, target).catch(error => log('warn', `reply send failed: ${error?.message ?? error}`))
         }
         break
       }

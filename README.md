@@ -4,11 +4,31 @@
 
 开源项目，MIT 许可，不发 npm。
 
-> ⚠️ **隐私提示（请先读这条）**
-> 装上之后，插件会把飞书群里**每一条**用户文本消息原样投递给你的 DSH 会话，作为一条普通消息进入管的上下文；管家的回复也会**原样发送回这个群**，群里所有人都能看到。
-> 也就是说：群里说的话会离开飞书、进入你的本地 DSH 会话与 LLM 请求；DSH 的回答会公开发到群里。
-> **长回复会在群里显示为多条消息**（详见下方[回复怎么发到群里](#回复怎么发到群里)），不是一条被截断的消息。
-> 请只把它接到你愿意这样做的群。敏感群、外部人员群不要用。
+## 功能一览
+
+一张表看全，细节在下面各节。
+
+| 能力 | 默认 | 说明 |
+| --- | --- | --- |
+| **群消息 → 管家** | 开 | 群里每一条纯文字都投递进 DSH，前缀 `[飞书群消息]` |
+| **管家回复 → 群** | 开 | 每次回复以卡片发回群，Markdown 正常渲染；超 3500 字按行拆成多张卡片 |
+| **群图片 → 管家** | 开 | 图片归档到 `picDir`，同时把图片内容本身喂给管家 |
+| **私聊消息 → 管家** | 需配置 | 私聊 `chat_id` 要写进 `directChatIds`，见[私聊](#私聊一对一会话) |
+| **私聊回复 → 私聊** | 跟着上一条 | 私聊来的消息只回私聊，**不会漏进群** |
+| **DSH 对话 → 飞书** | 开 | 你在 DSH 主对话里打的字和管家的回复都镜像到群，手机上不会漏 |
+| **群聊（开发组/健康组）→ 飞书** | 关 | Bot 之间的讨论不外泄 |
+
+## 隐私提示
+
+> ⚠️ **请先读这条**
+>
+> - 群里/私聊里**每一条**用户文本消息都会原样投递进你的 DSH 会话，进入管家的上下文，也进入 LLM 请求。
+> - 管家的回复会**原样发回**原会话（群里来的回群、私聊来的回私聊）。群里说的话群里**所有人都能看到**。
+> - **DSH 主对话会镜像到飞书**：你在 DSH 界面里对管家说的话、管家的回复，都会发到 `chatId` 那个群。飞书是云端服务，这些内容会存在飞书服务器上。**不要把不能外传的内容放进主对话**。
+> - 不想镜像 DSH 对话就改代码里的 `sendUserMirror` 调用点（见[镜像 DSH 对话](#镜像-dsh-对话到飞书)）。
+> - 私聊一律只回私聊。若 `directChatIds` 里配了别人的私聊，那个人说的话也会进你的管家会话。
+>
+> **长回复会在群里显示为多条消息**，不是一条被截断的消息。
 
 ## 前置条件
 
@@ -23,7 +43,7 @@
 ## 一览：从零到跑通
 
 1. [在飞书建自建应用](#1-在飞书建自建应用拿-app-id--app-secret)，拿到 App ID / App Secret；
-2. [给应用开权限](#2-给应用开权限要开哪三个)，把机器人拉进群；
+2. [给应用开权限](#2-给应用开权限)，把机器人拉进群；
 3. [拿到群 chat_id](#3-拿到群-chat_id)；
 4. [安装插件](#安装)（clone + 跑 install.ps1 + 重启 DSH）；
 5. [填配置](#配置)（推荐用设置页）；
@@ -39,7 +59,7 @@
    - **App ID**：形如 `cli_xxxxxxxxxxxxxxxx` → 对应插件配置里的 `appId`
    - **App Secret**：形如 `xxxxx...` → 对应插件的 App Secret（**不要**贴进任何文件或仓库，用设置页填）
 
-## 2. 给应用开权限（要开哪三个）
+## 2. 给应用开权限
 
 在 **权限管理** 页搜索并开通下面这些权限。它们和插件实际调用的接口一一对应，缺任何一个都会在运行时报错：
 
@@ -48,6 +68,10 @@
 | `im:message`（获取与发送单聊、群组消息） | 读群消息列表（`GET /open-apis/im/v1/messages`） | 轮询失败，日志报 `message list refused (code ...)` |
 | `im:message:send_as_bot`（以应用身份发消息） | 把管家回复发回群里（`POST /open-apis/im/v1/messages`） | 收得到群消息，但回复发不出去，日志报 `send refused (code ...)` |
 | `im:chat:readonly`（获取群组信息，只读） | 按 `container_id_type=chat` 定位群 | 读消息时可能被拒 |
+| `im:message.p2p_msg:readonly`（获取用户发送的单聊消息） | **只想接私聊时才需要**，读私聊消息 | 私聊读不到，日志报 `direct chat ... failed` |
+| `im:resource`（获取消息中的资源文件） | 下载群/私聊里的图片 | 图片存不下来，日志报 image download refused |
+
+只接群的话前三个就够；要接私聊必须再加 `im:message.p2p_msg:readonly`。
 
 开通权限后，**需要发布应用版本并等管理员审批生效**（企业自建应用通常要走这一步），否则权限不生效。
 
@@ -242,7 +266,117 @@ App Secret 不进代码、不进仓库。插件按 `secretName`（默认 `FEISHU
 
 **怎么写入**：用设置页的「App Secret」栏填一次并保存（推荐）；它由 DSH 凭据库接管，写进第 1 条路径，**不回显**。设置页里的「凭据名」就是 `secretName`，改它等于换一个凭据条目。
 
-> ⚠️ **设 `FEISHU_APP_SECRET` 这个环境变量是没用的。** 插件全文只读三个环境变量：`DSH_HOME`、`FEISHU_BRIDGE_APP_ID`、`FEISHU_BRIDGE_CHAT_ID`——**它自己不读 secret 的环境变量**。官方凭据库确实有「启动环境优先」的机制，但那要求该变量由 DSH 以启动环境注入，普通地 export 一个同名变量**读不到**，插件会静默回退到第 2 条路径，看起来像「设了不生效」。
+> ⚠️ **设 `FEISHU_APP_SECRET` 这个环境变量是没用的。** 插件全文只读四个环境变量：`DSH_HOME`、`FEISHU_BRIDGE_APP_ID`、`FEISHU_BRIDGE_CHAT_ID`、`FEISHU_BRIDGE_DIRECT_CHAT_IDS`——**它自己不读 secret 的环境变量**。官方凭据库确实有「启动环境优先」的机制，但那要求该变量由 DSH 以启动环境注入，普通地 export 一个同名变量**读不到**，插件会静默回退到第 2 条路径，看起来像「设了不生效」。
+
+---
+
+## 私聊（一对一会话）
+
+群接上了 ≠ 私聊接上了，**这是两件独立的事**。私聊要单独配，因为飞书没有提供「机器人的私聊列表」接口。
+
+### 为什么必须手填 chat_id
+
+`GET /open-apis/im/v1/chats` 只返回机器人**所在的群**，不返回私聊会话。所以插件没法自动发现你有几个私聊，只能把 `chat_id` 写进 `directChatIds`。
+
+### 怎么拿到私聊的 chat_id
+
+**方式 A（推荐）：先让机器人给你发一条私聊，接口会回给你 chat_id。**
+
+1. 手机或飞书客户端里打开和这个机器人的**私聊**，随便发一句话（比如「1」）。
+2. 调一次发消息接口，响应里的 `chat_id` 就是私聊 ID：
+
+```bash
+# 把 $TOKEN 换成 tenant_access_token，$OPEN_ID 换成你的 open_id
+curl -X POST 'https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id' \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"receive_id":"ou_xxxxxxxx","msg_type":"text","content":"{\"text\":\"hi\"}"}'
+```
+
+响应里 `data.chat_id` 形如 `oc_xxxxxxxx...`，**这就是私聊 chat_id**。
+
+**方式 B**：在飞书开发者后台的 **API 调试台**，用同一个应用调 `POST /open-apis/im/v1/messages`（`receive_id_type=open_id`），同样能从响应里拿到 `chat_id`。
+
+### 怎么配
+
+**设置页**：暂时没有私聊输入框（只有 `appId` / `chatId` / `picDir` / `pollSeconds` / `secretName` 有）。私聊要用下面的方式配。
+
+**本机配置**（`~/.dsh/plugins/feishu-bridge/cordis.patch.yml` 或 profile patch 层）：
+
+```yaml
+config:
+  appId: cli_xxxxxxxxxxxxxxxx
+  chatId: oc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  directChatIds:
+    - oc_yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+    - oc_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz   # 想接几个私聊就列几个
+```
+
+**环境变量**（项目外，不进仓库）：
+
+```powershell
+$env:FEISHU_BRIDGE_DIRECT_CHAT_IDS="oc_yyyyyyyy,oc_zzzzzzzz"   # 逗号分隔
+```
+
+### 需要的权限
+
+私聊要比群多开一项 `im:message.p2p_msg:readonly`（获取用户发送的单聊消息）。发消息复用 `im:message:send_as_bot`，下载图片复用 `im:resource`。
+
+### 回复去哪
+
+**私聊来的消息只回私聊，绝不进群。** 这是硬隔离：插件记录每条消息来自哪个会话，回复时送回原会话。群里来的回群，私聊来的回私聊。
+
+### 每个会话各记各的游标
+
+群和每个私聊各有一条游标，存在 `~/.dsh/bot/feishu-bridge-cursor.json`：
+
+```json
+{
+  "lastCreateTime": 1792215597188,
+  "chatId": "oc_...",
+  "direct": { "oc_...": 1792216230469 }
+}
+```
+
+一个会话里的坏图片不会卡住另一个会话的消息。
+
+---
+
+## 镜像 DSH 对话到飞书
+
+**这是默认开启的。** 你在 DSH 界面里对管家说的话、管家的回复，都会发到 `chatId` 那个群。目的是手机远程时不会漏掉桌面上的对话。
+
+效果长这样：
+
+```
+飞书群里你会看到：
+┌──────────────────────────┐
+│ 我在 DSH 里说            │   ← 灰色标题，表示这是你在桌面打的字
+│ 帮我查这周开销            │
+└──────────────────────────┘
+┌──────────────────────────┐
+│ 这周 1280，餐饮 620 占一半 │   ← 管家的回复，无标题
+└──────────────────────────┘
+```
+
+**不会镜像的**：
+
+- 飞书消息本身（否则会无限回环）
+- DSH 自己注入的时钟消息
+- 开发组 / 健康组等**群聊**里的对话——Bot 之间的讨论不外泄
+
+**怎么关掉**
+
+在 `index.js` 的 `onSessionEvent` 里，删掉 `user/message` 分支中这两行：
+
+```js
+feishuPending = true                                       // 让回复也发飞书
+void sendUserMirror(typed).catch(...)                      // 镜像用户说的话
+```
+
+只删第一行 = 桌面说的话不镜像，但管家的回复仍发群；两行都删 = 完全恢复成「只转发飞书触发的回合」。
+
+**隐私权衡**：开了这条，DSH 主对话的全部内容都会经飞书云端。别在 DSH 里说不能外传的话，或者先关掉它。
 
 ---
 
@@ -261,8 +395,13 @@ App Secret 不进代码、不进仓库。插件按 `secretName`（默认 `FEISHU
 | 设置页显示「该插件当前未加载」 | 插件没被 DSH 加载 | 检查安装是否成功、DSH 是否已重启 |
 | 群里有消息但管家没反应 | 首次启动只记基准、不回放历史；或轮询间隔未到 | 启动后**再发**一条；确认 `pollSeconds` |
 | 保存设置看起来成功但没生效 | volatile 字段被清空导致写门拒绝 | 至少保留一个非空 volatile 字段 |
+| **私聊发消息，管家没反应** | `directChatIds` 没配，或配的 chat_id 不对 | 见[私聊](#私聊一对一会话)，确认列表里有那个 `oc_` |
+| **私聊的回复跑到群里去了** | 不该发生，是 bug | 报 issue，附上 `replyTo` 相关日志 |
+| `direct chat list failed` / `direct chat oc_... failed` | 某个私聊读失败 | 不影响群；检查该私聊 chat_id 和 `im:message.p2p_msg:readonly` 权限 |
+| 群里出现「我在 DSH 里说」的卡片 | DSH 对话镜像（默认开着） | 正常行为；不想看就按[镜像 DSH 对话](#镜像-dsh-对话到飞书)关掉 |
+| 飞书消息在群里出现两次 | 镜像和回传撞了，或 cursor 重置 | 检查 `feishu-bridge-cursor.json` 是否被删过 |
 
-排查顺序建议：先确认「配置非空 → secret 有值 → token 能取到 → 能读消息 → 能发消息」，这条链路每一步的失败日志都不一样，按顺序看即可。
+排查顺序建议：先确认「配置非空 → secret 有值 → token 能取到 → 能读消息 → 能发消息」，这条链路每一步的失败日志都不一样，按顺序看即可。私聊不通时，单独确认「`directChatIds` 非空 → 该 chat_id 能读到消息」。还要注意：**改了 `index.js` 必须重启 DSH**，插件是进程内加载的，不重启跑的还是旧代码。
 
 ---
 
